@@ -7,11 +7,10 @@ import { SvgExclamationOutline } from '@actual-app/components/icons/v1';
 import { Popover } from '@actual-app/components/popover';
 import { theme } from '@actual-app/components/theme';
 import { View } from '@actual-app/components/view';
-import { send } from '@actual-app/core/platform/client/connection';
 import type { AccountEntity } from '@actual-app/core/types/models';
 
 import { useUnlinkAccountMutation } from '#accounts';
-import { markAccountSuccess } from '#accounts/accountsSlice';
+import { claimEnableBankingImportDevice } from '#accounts/enableBankingImportDevice';
 import { getFailedSyncError, isAccountFailedSync } from '#accounts/syncStatus';
 import { Link } from '#components/common/Link';
 import { authorizeBank as authorizeEnableBanking } from '#enablebanking';
@@ -179,8 +178,7 @@ export function AccountSyncCheck() {
             setClaimPending(true);
             setClaimFailed(false);
             try {
-              await send('enablebanking-claim-import-device', { id });
-              dispatch(markAccountSuccess({ id }));
+              await claimEnableBankingImportDevice(dispatch, id);
             } catch {
               setClaimFailed(true);
             } finally {

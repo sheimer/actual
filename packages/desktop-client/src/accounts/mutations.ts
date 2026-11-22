@@ -15,6 +15,7 @@ import type {
 } from '@actual-app/core/types/models';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient, QueryKey } from '@tanstack/react-query';
+import type { TFunction } from 'i18next';
 import { v4 as uuidv4 } from 'uuid';
 
 import { sync } from '#app/appSlice';
@@ -31,6 +32,7 @@ import {
   markUpdatedAccounts,
   setAccountsSyncing,
 } from './accountsSlice';
+import { notifyEnableBankingImportDeviceRequired } from './enableBankingImportDevice';
 import { accountQueries } from './queries';
 
 const invalidateQueries = (queryClient: QueryClient, queryKey?: QueryKey) => {
@@ -673,6 +675,7 @@ export function useSyncAccountsMutation() {
             newTransactions,
             matchedTransactions,
             updatedAccounts,
+            t,
           );
           if (success) isSyncSuccess = true;
         }
@@ -701,6 +704,8 @@ export function useSyncAccountsMutation() {
           newTransactions,
           matchedTransactions,
           updatedAccounts,
+          t,
+          accounts.find(account => account.id === accountId)?.name,
         );
 
         if (success) isSyncSuccess = true;
@@ -744,6 +749,8 @@ function handleSyncResponse(
   resNewTransactions: Array<TransactionEntity['id']>,
   resMatchedTransactions: Array<TransactionEntity['id']>,
   resUpdatedAccounts: Array<AccountEntity['id']>,
+  t: TFunction,
+  accountName?: string,
 ) {
   const { errors, newTransactions, matchedTransactions, updatedAccounts } = res;
 
@@ -768,6 +775,15 @@ function handleSyncResponse(
   // Dispatch errors (if any)
   errors.forEach(error => {
     if ('type' in error && error.type === 'SyncError') {
+      if (error.code === 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED') {
+        notifyEnableBankingImportDeviceRequired(
+          dispatch,
+          t,
+          accountId,
+          accountName,
+        );
+        return;
+      }
       dispatch(
         addNotification({
           notification: {

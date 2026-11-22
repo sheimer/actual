@@ -17,6 +17,9 @@ import { AccountSyncCheck } from './AccountSyncCheck';
 
 const mockDispatch = vi.fn();
 
+// The shared test setup imports the app store before this file's mocks.
+vi.hoisted(() => vi.resetModules());
+
 vi.mock(
   '@actual-app/core/platform/client/connection',
   async importOriginal => ({
