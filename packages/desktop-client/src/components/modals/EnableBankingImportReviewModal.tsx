@@ -32,9 +32,11 @@ export function EnableBankingImportReviewModal({
     queryKey,
     queryFn: () => send('enablebanking-import-review', { id: accountId }),
     retry: false,
+    refetchInterval: 5000,
   });
 
   const pendingImport = review.data;
+  const accepted = pendingImport && 'accepted' in pendingImport;
   const apply = useMutation({
     mutationFn: ({
       revision,
@@ -48,15 +50,22 @@ export function EnableBankingImportReviewModal({
         revision,
         choices,
       }),
-    onSuccess: response => {
+    onSuccess: (response, submitted) => {
       if (response.review) {
         queryClient.setQueryData(queryKey, response.review);
-      } else {
+      } else if (response.result) {
         queryClient.setQueryData(queryKey, null);
         dispatch(markAccountSuccess({ id: accountId }));
         void queryClient.invalidateQueries({
           queryKey: accountQueries.lists(),
         });
+      } else {
+        queryClient.setQueryData<typeof pendingImport | null>(
+          queryKey,
+          current =>
+            current?.revision === submitted.revision ? null : current,
+        );
+        void review.refetch();
       }
     },
     onError: () => {
@@ -88,11 +97,43 @@ export function EnableBankingImportReviewModal({
             <Text role="alert">
               <Trans>Could not load the bank import.</Trans>
             </Text>
-          ) : pendingImport ? (
+          ) : pendingImport && accepted ? (
+            <>
+              <Text>
+                <Trans>The import was confirmed and is ready to finish.</Trans>
+              </Text>
+              {apply.isError && (
+                <Text role="alert">
+                  <Trans>Could not finish the bank import. Try again.</Trans>
+                </Text>
+              )}
+              <ModalButtons>
+                <Button onPress={() => state.close()}>
+                  <Trans>Close</Trans>
+                </Button>
+                <Button
+                  variant="primary"
+                  isDisabled={apply.isPending}
+                  onPress={() =>
+                    apply.mutate(
+                      { revision: pendingImport.revision, choices: [] },
+                      {
+                        onSuccess: response => {
+                          if (response.result) state.close();
+                        },
+                      },
+                    )
+                  }
+                >
+                  <Trans>Finish import</Trans>
+                </Button>
+              </ModalButtons>
+            </>
+          ) : pendingImport && 'conflicts' in pendingImport ? (
             <ReviewForm
               key={pendingImport.revision}
               review={pendingImport}
-              busy={apply.isPending || review.isFetching}
+              busy={apply.isPending}
               failed={apply.isError}
               refreshed={!!apply.data?.review}
               onClose={() => state.close()}
@@ -109,9 +150,7 @@ export function EnableBankingImportReviewModal({
             />
           ) : (
             <Text>
-              <Trans>
-                There is no bank import waiting for review on this device.
-              </Trans>
+              <Trans>There is no bank import waiting for review.</Trans>
             </Text>
           )}
           {!pendingImport && (

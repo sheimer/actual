@@ -81,3 +81,50 @@ test('selects the import device from the bank-sync notification', async () => {
     store.getState().account.failedAccounts['test-account'],
   ).toBeUndefined();
 });
+
+test('opens the account review from the bank-sync warning', async () => {
+  const store = createTestAppStore();
+  vi.mocked(send).mockClear();
+  vi.mocked(useAccounts).mockReturnValue({
+    data: [{ id: 'test-account', name: 'Synthetic Checking' }],
+  } as ReturnType<typeof useAccounts>);
+  vi.mocked(send).mockResolvedValueOnce({
+    newTransactions: [],
+    matchedTransactions: [],
+    updatedAccounts: [],
+    errors: [
+      {
+        type: 'SyncError',
+        accountId: 'test-account',
+        category: 'ACCOUNT_NEEDS_ATTENTION',
+        code: 'ENABLE_BANKING_REVIEW_REQUIRED',
+        message:
+          'Review the downloaded Enable Banking transactions before importing.',
+      },
+    ],
+  });
+
+  render(
+    <TestProviders store={store}>
+      <SyncTestAccount />
+      <Notifications />
+    </TestProviders>,
+  );
+  const user = userEvent.setup();
+  await user.click(screen.getByRole('button', { name: 'Bank Sync' }));
+  const review = await screen.findByRole('button', {
+    name: 'Review bank import',
+  });
+  await user.click(review);
+
+  expect(store.getState().modals.modalStack).toMatchObject([
+    {
+      name: 'enablebanking-import-review',
+      options: { accountId: 'test-account' },
+    },
+  ]);
+  expect(vi.mocked(send).mock.calls).toEqual([
+    ['accounts-bank-sync', { ids: ['test-account'] }],
+  ]);
+  await waitFor(() => expect(review).not.toBeInTheDocument());
+});

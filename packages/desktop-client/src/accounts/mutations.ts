@@ -20,6 +20,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { sync } from '#app/appSlice';
 import { useAccounts } from '#hooks/useAccounts';
+import { pushModal } from '#modals/modalsSlice';
 import { addNotification } from '#notifications/notificationsSlice';
 import { payeeQueries } from '#payees';
 import { useDispatch, useStore } from '#redux';
@@ -784,11 +785,32 @@ function handleSyncResponse(
         );
         return;
       }
+      const requiresReview = error.code === 'ENABLE_BANKING_REVIEW_REQUIRED';
       dispatch(
         addNotification({
           notification: {
-            type: 'error',
-            message: error.message,
+            type: requiresReview ? 'warning' : 'error',
+            title: requiresReview ? accountName : undefined,
+            message: requiresReview
+              ? t(
+                  'Review the downloaded Enable Banking transactions before importing.',
+                )
+              : error.message,
+            button: requiresReview
+              ? {
+                  title: t('Review bank import'),
+                  action: () => {
+                    dispatch(
+                      pushModal({
+                        modal: {
+                          name: 'enablebanking-import-review',
+                          options: { accountId },
+                        },
+                      }),
+                    );
+                  },
+                }
+              : undefined,
           },
         }),
       );

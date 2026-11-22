@@ -100,3 +100,32 @@ test('reviews a revised import before sending decisions for the latest revision'
     choices: [{ index: 0, action: 'skip' }],
   });
 });
+
+test('offers to finish a confirmation accepted on another client', async () => {
+  const user = userEvent.setup();
+  vi.mocked(send).mockResolvedValueOnce({
+    accepted: true,
+    revision: 'accepted-batch',
+    conflicts: [],
+  });
+  vi.mocked(send).mockResolvedValueOnce({
+    result: { added: ['payment'], updated: [] },
+  });
+
+  render(
+    <TestProviders>
+      <EnableBankingImportReviewModal accountId="checking" />
+    </TestProviders>,
+  );
+
+  expect(
+    await screen.findByText('The import was confirmed and is ready to finish.'),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole('combobox')).toBeNull();
+  await user.click(screen.getByRole('button', { name: 'Finish import' }));
+  expect(send).toHaveBeenLastCalledWith('enablebanking-import-resolve', {
+    id: 'checking',
+    revision: 'accepted-batch',
+    choices: [],
+  });
+});

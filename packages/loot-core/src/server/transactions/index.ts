@@ -2,7 +2,7 @@
 
 import * as connection from '#platform/server/connection';
 import * as db from '#server/db';
-import { incrFetch, whereIn } from '#server/db/util';
+import { fetchByIds, whereIn } from '#server/db/util';
 import { batchMessages } from '#server/sync';
 import type { Diff } from '#shared/util';
 import type { PayeeEntity, TransactionEntity } from '#types/models';
@@ -25,15 +25,12 @@ async function idsWithChildren(ids: string[]) {
 async function getTransactionsByIds(
   ids: string[],
 ): Promise<TransactionEntity[]> {
-  // TODO: convert to whereIn
-  //
-  // or better yet, use ActualQL
-  return incrFetch(
-    (query, params) => db.selectWithSchema('transactions', query, params),
-    ids,
-
-    id => `id = '${id}'`,
-    where => `SELECT * FROM v_transactions_internal WHERE ${where}`,
+  return fetchByIds(ids, (placeholders, page) =>
+    db.selectWithSchema(
+      'transactions',
+      `SELECT * FROM v_transactions_internal WHERE id IN (${placeholders})`,
+      page,
+    ),
   );
 }
 
@@ -44,10 +41,12 @@ export async function batchUpdateTransactions({
   learnCategories = false,
   detectOrphanPayees = true,
   runTransfers = true,
+  replayed,
 }: Partial<Diff<TransactionEntity>> & {
   learnCategories?: boolean;
   detectOrphanPayees?: boolean;
   runTransfers?: boolean;
+  replayed?: string[];
 }) {
   // Track the ids of each type of transaction change (see below for why)
   let addedIds = [];
@@ -135,7 +134,12 @@ export async function batchUpdateTransactions({
   // One read for all of them: on the web backend every query is a
   // separate lock/commit cycle against IndexedDB
   const changedTransactions = await getTransactionsByIds([
-    ...new Set([...addedIds, ...updatedIds, ...deletedIds]),
+    ...new Set([
+      ...addedIds,
+      ...updatedIds,
+      ...deletedIds,
+      ...(replayed ?? []),
+    ]),
   ]);
   const changedById = new Map(
     changedTransactions.map(transaction => [transaction.id, transaction]),
@@ -160,11 +164,16 @@ export async function batchUpdateTransactions({
 
   if (runTransfers) {
     await batchMessages(async () => {
-      await Promise.all(allAdded.map(t => transfer.onInsert(t)));
+      await Promise.all(allAdded.map(t => transfer.onInsert(t, !!replayed)));
+      await Promise.all(
+        pickTransactions(replayed ?? [])
+          .filter(t => !t.tombstone && !t.transfer_id)
+          .map(t => transfer.onInsert(t, true)),
+      );
 
       // Return any updates from here
       transfersUpdated = (
-        await Promise.all(allUpdated.map(t => transfer.onUpdate(t)))
+        await Promise.all(allUpdated.map(t => transfer.onUpdate(t, !!replayed)))
       ).filter(Boolean);
 
       await Promise.all(allDeleted.map(t => transfer.onDelete(t)));

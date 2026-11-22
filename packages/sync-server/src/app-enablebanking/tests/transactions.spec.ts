@@ -1,5 +1,6 @@
 import express from 'express';
 import request from 'supertest';
+import type { MockInstance } from 'vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -29,8 +30,14 @@ vi.mock('../utils/jwt', () => ({
 vi.mock('../../util/middlewares', () => ({
   requestLoggerMiddleware: (_req: unknown, _res: unknown, next: () => void) =>
     next(),
-  validateSessionMiddleware: (_req: unknown, _res: unknown, next: () => void) =>
-    next(),
+  validateSessionMiddleware: (
+    req: express.Request,
+    res: express.Response,
+    next: () => void,
+  ) => {
+    res.locals.user_id = req.get('x-test-user') ?? 'owner';
+    next();
+  },
 }));
 
 vi.mock('../../app-gocardless/util/handle-error', () => ({
@@ -57,6 +64,7 @@ vi.mock('#account-db', () => ({
   isAdmin: () => false,
 }));
 
+const { createSharedImportTable } = await import('../shared-import');
 const { openDatabase } = await import('#db');
 const { createEnableBankingImportDevicesTable } =
   await import('../import-device');
@@ -234,5 +242,123 @@ describe('POST /transactions', () => {
       expect.any(String),
       expect.objectContaining({ 'Psu-Ip-Address': '136.243.37.31' }),
     );
+  });
+});
+
+describe('POST /shared-import', () => {
+  const scope = {
+    fileId: 'file',
+    groupId: 'group',
+    accountId: 'local-account',
+    connectionId: 'acc-1',
+  };
+  const send = (data: object, user = 'owner') =>
+    request(app)
+      .post('/shared-import')
+      .set('x-test-user', user)
+      .send({ ...scope, ...data });
+
+  let bankDownload: MockInstance<
+    typeof enableBankingService.getAllTransactions
+  >;
+
+  beforeEach(() => {
+    accountDb = openDatabase(':memory:');
+    accountDb.exec(`
+      CREATE TABLE files (id TEXT PRIMARY KEY, group_id TEXT, deleted INTEGER, owner TEXT);
+      CREATE TABLE user_access (file_id TEXT, user_id TEXT);
+      INSERT INTO files VALUES ('file', 'group', 0, 'owner');
+      INSERT INTO user_access VALUES ('file', 'collaborator');
+    `);
+    createSharedImportTable();
+    vi.spyOn(enableBankingService, 'getBalances').mockResolvedValue({
+      balances: [],
+    });
+    bankDownload = vi
+      .spyOn(enableBankingService, 'getAllTransactions')
+      .mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    accountDb.close();
+    vi.restoreAllMocks();
+  });
+
+  it('shares one download and keeps just the winning plan until completion', async () => {
+    const first = { action: 'download', startDate: '2026-04-01' };
+    const [a, b] = await Promise.all([
+      send(first),
+      send(first, 'collaborator'),
+    ]);
+    const batch = a.body.data;
+    expect(batch.state).toBe('open');
+    expect(b.body.data).toEqual(batch);
+    expect(bankDownload).toHaveBeenCalledTimes(1);
+
+    const choices = ['first-plan', 'second-plan'];
+    const confirmations = await Promise.all(
+      choices.map((plan, index) =>
+        send(
+          { action: 'confirm', id: batch.id, plan },
+          index === 0 ? 'owner' : 'collaborator',
+        ),
+      ),
+    );
+    const won = confirmations.map(response => response.body.data.won);
+    expect(won.filter(Boolean)).toHaveLength(1);
+    const accepted = {
+      id: batch.id,
+      state: 'accepted',
+      download: null,
+      plan: choices[won.indexOf(true)],
+    };
+    expect((await send(first)).body.data).toEqual(accepted);
+    expect((await send({ action: 'read' }, 'collaborator')).body.data).toEqual(
+      accepted,
+    );
+    expect(bankDownload).toHaveBeenCalledTimes(1);
+
+    const completed = {
+      id: batch.id,
+      state: 'completed',
+      download: null,
+      plan: null,
+    };
+    expect(
+      (await send({ action: 'complete', id: batch.id }, 'collaborator')).body
+        .data,
+    ).toEqual(completed);
+    expect((await send(first)).body.data).toEqual(completed);
+
+    const next = (await send({ ...first, after: batch.id })).body.data;
+    expect(next.id).not.toBe(batch.id);
+    expect(
+      (await send({ action: 'confirm', id: batch.id, plan: 'stale' })).body
+        .data,
+    ).toEqual({
+      won: false,
+      batch: next,
+    });
+    expect(
+      (await send({ action: 'complete', id: batch.id })).body.data,
+    ).toEqual(next);
+    expect(bankDownload).toHaveBeenCalledTimes(2);
+  });
+
+  it('scopes pending data to authorized users and clears it when budget sync resets', async () => {
+    const first = { action: 'download', startDate: '2026-04-01' };
+    expect((await send(first, 'other')).status).toBe(403);
+    expect((await send({ ...first, groupId: 'stale' })).status).toBe(403);
+    expect(bankDownload).not.toHaveBeenCalled();
+    expect((await send(first)).body.data.state).toBe('open');
+
+    accountDb.mutate(
+      "UPDATE files SET group_id = 'new-group' WHERE id = 'file'",
+    );
+    expect((await send({ action: 'read' })).status).toBe(403);
+    expect(
+      (await send({ action: 'read', groupId: 'new-group' })).body.data,
+    ).toBeNull();
+    expect(accountDb.all('SELECT * FROM enable_banking_imports')).toEqual([]);
   });
 });

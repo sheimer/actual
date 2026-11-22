@@ -25,6 +25,13 @@ import {
   normalizeBalance,
   normalizeTransactions,
 } from './services/enablebanking-service';
+import {
+  completeImport,
+  confirmImport,
+  downloadImport,
+  getImportScope,
+  readImport,
+} from './shared-import';
 import { EnableBankingError } from './utils/errors';
 
 const debugSensitive = createDebug('actual-sensitive:enable-banking');
@@ -590,133 +597,207 @@ app.post(
       return;
     }
 
-    try {
-      const dateTo = new Date().toISOString().split('T')[0];
-      const dateFrom =
-        typeof startDate === 'string'
-          ? startDate
-          : new Date(startDate).toISOString().split('T')[0];
-
-      const psuHeaders = dataAccessPsuHeaders(
-        aspspName,
-        extractPsuHeaders(req),
-      );
-
-      // Some banks reject the balances call outright. Carry on without a
-      // balance rather than giving up on the transactions, as account
-      // discovery already does.
-      let balances: ReturnType<typeof normalizeBalance>[] = [];
-      try {
-        const balanceResult = await enableBankingService.getBalances(
-          accountId,
-          psuHeaders,
-        );
-        balances = balanceResult.balances.map(normalizeBalance);
-      } catch (err) {
-        debug('Failed to fetch account balances');
-        debugSensitive(
-          'Failed to fetch balances for account %s: %O',
-          accountId,
-          err,
-        );
-      }
-
-      // Determine starting balance, preferring CLAV balance type. `null`
-      // when the bank reported none, so the client does not treat it as 0.
-      let startingBalance: number | null = null;
-      if (balances.length > 0) {
-        const preferredBalance =
-          balances.find(b => b.balanceType === 'CLAV') ?? balances[0];
-        startingBalance = preferredBalance.balanceAmount.amount;
-      }
-
-      // Fetch all paginated transactions
-      const rawTransactions = await enableBankingService.getAllTransactions(
-        accountId,
-        dateFrom,
-        dateTo,
-        psuHeaders,
-      );
-
-      const all: ReturnType<typeof normalizeTransactions> = [];
-      const booked: ReturnType<typeof normalizeTransactions> = [];
-      const pending: ReturnType<typeof normalizeTransactions> = [];
-
-      for (const normalized of normalizeTransactions(rawTransactions)) {
-        // Drop records Actual's client can't insert (empty/non-ISO date or
-        // non-numeric amount) — one of them would otherwise abort the entire
-        // account sync. Pending transactions that carry a date are unaffected.
-        if (!isImportableTransaction(normalized)) {
-          debugSensitive(
-            'Skipping unimportable transaction id=%s date=%s amount=%s',
-            normalized.transactionId,
-            normalized.date,
-            normalized.transactionAmount.amount,
-          );
-          continue;
-        }
-
-        all.push(normalized);
-        if (normalized.booked) {
-          booked.push(normalized);
-        } else {
-          pending.push(normalized);
-        }
-      }
-
-      res.send({
-        status: 'ok',
-        data: {
-          transactions: {
-            all,
-            booked,
-            pending,
-          },
-          balances,
-          startingBalance,
-        },
-      });
-    } catch (error) {
-      debug('Error fetching transactions');
-      debugSensitive('Error fetching transactions: %O', error);
-
-      // Return structured error codes so the client can show
-      // appropriate UI (e.g. re-auth prompt for expired sessions)
-      if (error instanceof EnableBankingError) {
-        if (error.error_code === 'INVALID_ACCESS_TOKEN') {
-          res.send({
-            status: 'ok',
-            data: {
-              error_type: 'ITEM_ERROR',
-              error_code: 'ITEM_LOGIN_REQUIRED',
-            },
-          });
-          return;
-        }
-
-        // The bank-sync wire format expects `error_type` to be a broad
-        // machine-readable category (matched by AccountSyncCheck's switch),
-        // not the human message we now keep on `EnableBankingError.error_type`.
-        const wireErrorType =
-          error.error_code === 'NOT_FOUND' ? 'INVALID_INPUT' : error.error_code;
-
-        res.send({
-          status: 'ok',
-          data: {
-            error_type: wireErrorType,
-            error_code: error.error_code,
-          },
-        });
-        return;
-      }
-
-      res.send({
-        status: 'ok',
-        data: {
-          error_type: 'INTERNAL_ERROR',
-          error_code: 'INTERNAL_ERROR',
-        },
-      });
-    }
+    res.send({
+      status: 'ok',
+      data: await fetchTransactions(req, accountId, startDate, aspspName),
+    });
   }),
 );
+
+app.post(
+  '/shared-import',
+  handleError(async (req: Request, res: Response) => {
+    const body = req.body;
+    const scope = getImportScope(body, res.locals.user_id);
+    if (!scope) {
+      res.status(403).send({ status: 'error', reason: 'forbidden' });
+      return;
+    }
+    let data;
+    switch (body.action) {
+      case 'read':
+        data = readImport(scope);
+        break;
+      case 'download':
+        if (
+          typeof body.startDate !== 'string' ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(body.startDate)
+        ) {
+          res.status(400).send({ status: 'error', reason: 'invalid-input' });
+          return;
+        }
+        data = await downloadImport(scope, body.after, async () => {
+          const response = await fetchTransactions(
+            req,
+            scope.connectionId,
+            body.startDate,
+            body.aspspName,
+          );
+          if (!response.transactions) {
+            return {
+              error_code: response.error_code ?? 'INTERNAL_ERROR',
+              error_type: response.error_type ?? 'INTERNAL_ERROR',
+            };
+          }
+          return {
+            download: {
+              transactions: response.transactions.all,
+              startingBalance: response.startingBalance,
+              initialSync: body.initialSync === true,
+              customStartingDate:
+                typeof body.customStartingDate === 'string'
+                  ? body.customStartingDate
+                  : undefined,
+              customStartingBalance:
+                typeof body.customStartingBalance === 'number'
+                  ? body.customStartingBalance
+                  : undefined,
+            },
+          };
+        });
+        break;
+      case 'adopt': {
+        const deviceError = enableBankingImportDeviceError(
+          scope.connectionId,
+          body.deviceId,
+        );
+        if (deviceError || !Array.isArray(body.download?.transactions)) {
+          res.status(400).send({ status: 'error', reason: 'invalid-input' });
+          return;
+        }
+        data = await downloadImport(scope, null, async () => ({
+          download: body.download,
+        }));
+        break;
+      }
+      case 'confirm':
+        if (
+          typeof body.id !== 'string' ||
+          typeof body.plan !== 'string' ||
+          !body.plan
+        ) {
+          res.status(400).send({ status: 'error', reason: 'invalid-input' });
+          return;
+        }
+        data = confirmImport(scope, body.id, body.plan);
+        break;
+      case 'complete':
+        if (typeof body.id !== 'string') {
+          res.status(400).send({ status: 'error', reason: 'invalid-input' });
+          return;
+        }
+        data = completeImport(scope, body.id);
+        break;
+      default:
+        res.status(400).send({ status: 'error', reason: 'invalid-input' });
+        return;
+    }
+    res.send({ status: 'ok', data });
+  }),
+);
+
+async function fetchTransactions(
+  req: Request,
+  accountId: string,
+  startDate: string | number,
+  aspspName?: string,
+) {
+  try {
+    const dateTo = new Date().toISOString().split('T')[0];
+    const dateFrom =
+      typeof startDate === 'string'
+        ? startDate
+        : new Date(startDate).toISOString().split('T')[0];
+
+    const psuHeaders = dataAccessPsuHeaders(aspspName, extractPsuHeaders(req));
+
+    // Some banks reject the balances call outright. Carry on without a
+    // balance rather than giving up on the transactions, as account
+    // discovery already does.
+    let balances: ReturnType<typeof normalizeBalance>[] = [];
+    try {
+      const balanceResult = await enableBankingService.getBalances(
+        accountId,
+        psuHeaders,
+      );
+      balances = balanceResult.balances.map(normalizeBalance);
+    } catch (err) {
+      debug('Failed to fetch account balances');
+      debugSensitive(
+        'Failed to fetch balances for account %s: %O',
+        accountId,
+        err,
+      );
+    }
+
+    // Determine starting balance, preferring CLAV balance type. `null`
+    // when the bank reported none, so the client does not treat it as 0.
+    let startingBalance: number | null = null;
+    if (balances.length > 0) {
+      const preferredBalance =
+        balances.find(b => b.balanceType === 'CLAV') ?? balances[0];
+      startingBalance = preferredBalance.balanceAmount.amount;
+    }
+
+    // Fetch all paginated transactions
+    const rawTransactions = await enableBankingService.getAllTransactions(
+      accountId,
+      dateFrom,
+      dateTo,
+      psuHeaders,
+    );
+
+    const all: ReturnType<typeof normalizeTransactions> = [];
+    const booked: ReturnType<typeof normalizeTransactions> = [];
+    const pending: ReturnType<typeof normalizeTransactions> = [];
+
+    for (const normalized of normalizeTransactions(rawTransactions)) {
+      // Drop records Actual's client can't insert (empty/non-ISO date or
+      // non-numeric amount) — one of them would otherwise abort the entire
+      // account sync. Pending transactions that carry a date are unaffected.
+      if (!isImportableTransaction(normalized)) {
+        debugSensitive(
+          'Skipping unimportable transaction id=%s date=%s amount=%s',
+          normalized.transactionId,
+          normalized.date,
+          normalized.transactionAmount.amount,
+        );
+        continue;
+      }
+
+      all.push(normalized);
+      if (normalized.booked) {
+        booked.push(normalized);
+      } else {
+        pending.push(normalized);
+      }
+    }
+
+    return {
+      transactions: { all, booked, pending },
+      balances,
+      startingBalance,
+    };
+  } catch (error) {
+    debug('Error fetching transactions');
+    debugSensitive('Error fetching transactions: %O', error);
+
+    // Return structured error codes so the client can show
+    // appropriate UI (e.g. re-auth prompt for expired sessions)
+    if (error instanceof EnableBankingError) {
+      if (error.error_code === 'INVALID_ACCESS_TOKEN') {
+        return { error_type: 'ITEM_ERROR', error_code: 'ITEM_LOGIN_REQUIRED' };
+      }
+
+      // The bank-sync wire format expects `error_type` to be a broad
+      // machine-readable category (matched by AccountSyncCheck's switch),
+      // not the human message we now keep on `EnableBankingError.error_type`.
+      const wireErrorType =
+        error.error_code === 'NOT_FOUND' ? 'INVALID_INPUT' : error.error_code;
+
+      return { error_type: wireErrorType, error_code: error.error_code };
+    }
+
+    return { error_type: 'INTERNAL_ERROR', error_code: 'INTERNAL_ERROR' };
+  }
+}
