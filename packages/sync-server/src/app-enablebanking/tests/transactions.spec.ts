@@ -1,5 +1,6 @@
 import express from 'express';
 import request from 'supertest';
+import type { MockInstance } from 'vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -7,6 +8,7 @@ import {
   mockPendingTransaction,
   mockPendingTransactionNoDate,
 } from '#app-enablebanking/services/tests/fixtures';
+import { EnableBankingError } from '#app-enablebanking/utils/errors';
 
 // Mock all external dependencies before importing the app (mirrors
 // poll-auth.spec.ts).
@@ -28,8 +30,14 @@ vi.mock('../utils/jwt', () => ({
 vi.mock('../../util/middlewares', () => ({
   requestLoggerMiddleware: (_req: unknown, _res: unknown, next: () => void) =>
     next(),
-  validateSessionMiddleware: (_req: unknown, _res: unknown, next: () => void) =>
-    next(),
+  validateSessionMiddleware: (
+    req: express.Request,
+    res: express.Response,
+    next: () => void,
+  ) => {
+    res.locals.user_id = req.get('x-test-user') ?? 'owner';
+    next();
+  },
 }));
 
 vi.mock('../../app-gocardless/util/handle-error', () => ({
@@ -51,6 +59,19 @@ vi.mock('../../app-gocardless/util/handle-error', () => ({
 // Mock provider requests (the service is stubbed below, this just guards stray calls)
 vi.mock('undici', () => ({ fetch: vi.fn() }));
 
+vi.mock('#account-db', () => ({
+  getAccountDb: () => accountDb,
+  isAdmin: () => false,
+}));
+
+const { createSharedImportTable } = await import('../shared-import');
+const { openDatabase } = await import('#db');
+const { createEnableBankingImportDevicesTable } =
+  await import('../import-device');
+let accountDb: ReturnType<typeof openDatabase>;
+const ownerId = '8fbac2eb-08c1-4c94-8f38-8f52821a013c';
+const otherId = '377d70d4-8dc5-4577-96fa-03ec09cb7dae';
+
 const { handlers } = await import('../app-enablebanking');
 const { enableBankingService } =
   await import('../services/enablebanking-service');
@@ -65,13 +86,66 @@ const ids = (txns: Array<{ transactionId: string }>) =>
 
 describe('POST /transactions', () => {
   beforeEach(() => {
+    accountDb = openDatabase(':memory:');
+    createEnableBankingImportDevicesTable();
+    accountDb.mutate(
+      'INSERT INTO enable_banking_import_devices VALUES (?, ?)',
+      ['acc-1', ownerId],
+    );
     vi.spyOn(enableBankingService, 'getBalances').mockResolvedValue({
       balances: [],
     });
   });
 
   afterEach(() => {
+    accountDb.close();
     vi.restoreAllMocks();
+  });
+
+  it('rejects two competing devices before making a bank request', async () => {
+    const getBalances = vi
+      .spyOn(enableBankingService, 'getBalances')
+      .mockResolvedValue({ balances: [] });
+    const getTransactions = vi
+      .spyOn(enableBankingService, 'getAllTransactions')
+      .mockResolvedValue([]);
+    const claims = await Promise.all(
+      [ownerId, otherId].map(deviceId =>
+        request(app)
+          .post('/import-device')
+          .send({ accountId: 'new-account', deviceId, claim: true }),
+      ),
+    );
+    const denied = claims.findIndex(
+      claim =>
+        claim.body.data.error_code === 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH',
+    );
+    expect(denied).toBeGreaterThanOrEqual(0);
+    expect(claims[1 - denied].body.data).toEqual({});
+    const deniedId = [ownerId, otherId][denied];
+    const allowed = [ownerId, otherId][1 - denied];
+
+    for (const [accountId, deviceId, code] of [
+      ['new-account', deniedId, 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH'],
+      ['unclaimed-account', allowed, 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED'],
+      ['new-account', undefined, 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED'],
+    ]) {
+      const response = await request(app).post('/transactions').send({
+        accountId,
+        deviceId,
+        startDate: '2026-03-01',
+      });
+      expect(response.body.data.error_code).toBe(code);
+    }
+    expect(getTransactions).not.toHaveBeenCalled();
+    expect(getBalances).not.toHaveBeenCalled();
+    const response = await request(app).post('/transactions').send({
+      accountId: 'new-account',
+      deviceId: allowed,
+      startDate: '2026-03-01',
+    });
+    expect(response.body.data.transactions.all).toEqual([]);
+    expect(getTransactions).toHaveBeenCalledTimes(1);
   });
 
   it('skips a date-less pending transaction while keeping valid booked and pending ones', async () => {
@@ -85,7 +159,7 @@ describe('POST /transactions', () => {
 
     const res = await request(app)
       .post('/transactions')
-      .send({ accountId: 'acc-1', startDate: '2026-03-01' });
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
 
     expect(res.body.status).toBe('ok');
 
@@ -107,9 +181,184 @@ describe('POST /transactions', () => {
 
     const res = await request(app)
       .post('/transactions')
-      .send({ accountId: 'acc-1', startDate: '2026-03-01' });
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
 
     expect(res.body.data.transactions.all).toHaveLength(2);
     expect(ids(res.body.data.transactions.all)).toEqual(['ref-002', 'tx-003']);
+  });
+
+  it('gives two identical transactions without a bank id distinct ids', async () => {
+    const withoutId = { ...mockDebitTransaction, entry_reference: undefined };
+    vi.spyOn(enableBankingService, 'getAllTransactions').mockResolvedValue([
+      withoutId,
+      withoutId,
+    ]);
+
+    const res = await request(app)
+      .post('/transactions')
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
+
+    const [first, second] = ids(res.body.data.transactions.all);
+    expect(first).toBeTruthy();
+    expect(second).toBeTruthy();
+    expect(first).not.toBe(second);
+  });
+
+  it('still imports transactions when the balance request fails', async () => {
+    // Some banks reject the balances call outright. That must not stop the
+    // transactions from being fetched.
+    vi.spyOn(enableBankingService, 'getBalances').mockRejectedValue(
+      new EnableBankingError('Error interacting with ASPSP', 'INVALID_INPUT'),
+    );
+    vi.spyOn(enableBankingService, 'getAllTransactions').mockResolvedValue([
+      mockDebitTransaction,
+    ]);
+
+    const res = await request(app)
+      .post('/transactions')
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
+
+    expect(res.body.status).toBe('ok');
+    expect(ids(res.body.data.transactions.all)).toEqual(['ref-002']);
+    expect(res.body.data.balances).toEqual([]);
+    expect(res.body.data.startingBalance).toBeNull();
+  });
+
+  it('sends an IPv4-mapped client address to the bank as plain IPv4', async () => {
+    // Node reports IPv4 clients as `::ffff:1.2.3.4` on dual-stack sockets and
+    // some banks reject that form of the PSU address.
+    const getAllTransactions = vi
+      .spyOn(enableBankingService, 'getAllTransactions')
+      .mockResolvedValue([]);
+
+    await request(app)
+      .post('/transactions')
+      .set('X-Forwarded-For', '::ffff:136.243.37.31')
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
+
+    expect(getAllTransactions).toHaveBeenCalledWith(
+      'acc-1',
+      '2026-03-01',
+      expect.any(String),
+      expect.objectContaining({ 'Psu-Ip-Address': '136.243.37.31' }),
+    );
+  });
+});
+
+describe('POST /shared-import', () => {
+  const scope = {
+    fileId: 'file',
+    groupId: 'group',
+    accountId: 'local-account',
+    connectionId: 'acc-1',
+  };
+  const send = (data: object, user = 'owner') =>
+    request(app)
+      .post('/shared-import')
+      .set('x-test-user', user)
+      .send({ ...scope, ...data });
+
+  let bankDownload: MockInstance<
+    typeof enableBankingService.getAllTransactions
+  >;
+
+  beforeEach(() => {
+    accountDb = openDatabase(':memory:');
+    accountDb.exec(`
+      CREATE TABLE files (id TEXT PRIMARY KEY, group_id TEXT, deleted INTEGER, owner TEXT);
+      CREATE TABLE user_access (file_id TEXT, user_id TEXT);
+      INSERT INTO files VALUES ('file', 'group', 0, 'owner');
+      INSERT INTO user_access VALUES ('file', 'collaborator');
+    `);
+    createSharedImportTable();
+    vi.spyOn(enableBankingService, 'getBalances').mockResolvedValue({
+      balances: [],
+    });
+    bankDownload = vi
+      .spyOn(enableBankingService, 'getAllTransactions')
+      .mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    accountDb.close();
+    vi.restoreAllMocks();
+  });
+
+  it('shares one download and keeps just the winning plan until completion', async () => {
+    const first = { action: 'download', startDate: '2026-04-01' };
+    const [a, b] = await Promise.all([
+      send(first),
+      send(first, 'collaborator'),
+    ]);
+    const batch = a.body.data;
+    expect(batch.state).toBe('open');
+    expect(b.body.data).toEqual(batch);
+    expect(bankDownload).toHaveBeenCalledTimes(1);
+
+    const choices = ['first-plan', 'second-plan'];
+    const confirmations = await Promise.all(
+      choices.map((plan, index) =>
+        send(
+          { action: 'confirm', id: batch.id, plan },
+          index === 0 ? 'owner' : 'collaborator',
+        ),
+      ),
+    );
+    const won = confirmations.map(response => response.body.data.won);
+    expect(won.filter(Boolean)).toHaveLength(1);
+    const accepted = {
+      id: batch.id,
+      state: 'accepted',
+      download: null,
+      plan: choices[won.indexOf(true)],
+    };
+    expect((await send(first)).body.data).toEqual(accepted);
+    expect((await send({ action: 'read' }, 'collaborator')).body.data).toEqual(
+      accepted,
+    );
+    expect(bankDownload).toHaveBeenCalledTimes(1);
+
+    const completed = {
+      id: batch.id,
+      state: 'completed',
+      download: null,
+      plan: null,
+    };
+    expect(
+      (await send({ action: 'complete', id: batch.id }, 'collaborator')).body
+        .data,
+    ).toEqual(completed);
+    expect((await send(first)).body.data).toEqual(completed);
+
+    const next = (await send({ ...first, after: batch.id })).body.data;
+    expect(next.id).not.toBe(batch.id);
+    expect(
+      (await send({ action: 'confirm', id: batch.id, plan: 'stale' })).body
+        .data,
+    ).toEqual({
+      won: false,
+      batch: next,
+    });
+    expect(
+      (await send({ action: 'complete', id: batch.id })).body.data,
+    ).toEqual(next);
+    expect(bankDownload).toHaveBeenCalledTimes(2);
+  });
+
+  it('scopes pending data to authorized users and clears it when budget sync resets', async () => {
+    const first = { action: 'download', startDate: '2026-04-01' };
+    expect((await send(first, 'other')).status).toBe(403);
+    expect((await send({ ...first, groupId: 'stale' })).status).toBe(403);
+    expect(bankDownload).not.toHaveBeenCalled();
+    expect((await send(first)).body.data.state).toBe('open');
+
+    accountDb.mutate(
+      "UPDATE files SET group_id = 'new-group' WHERE id = 'file'",
+    );
+    expect((await send({ action: 'read' })).status).toBe(403);
+    expect(
+      (await send({ action: 'read', groupId: 'new-group' })).body.data,
+    ).toBeNull();
+    expect(accountDb.all('SELECT * FROM enable_banking_imports')).toEqual([]);
   });
 });

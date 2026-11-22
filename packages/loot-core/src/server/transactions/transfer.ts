@@ -1,4 +1,6 @@
 // @ts-strict-ignore
+import { v5 as uuidv5 } from 'uuid';
+
 import * as db from '#server/db';
 
 import { runRules } from './transaction-rules';
@@ -44,7 +46,11 @@ async function clearCategory(transaction, transferAcct) {
   return false;
 }
 
-export async function addTransfer(transaction, transferredAccount) {
+export async function addTransfer(
+  transaction,
+  transferredAccount,
+  replayable = false,
+) {
   if (transaction.is_parent) {
     // For split transactions, we should create transfers using child transactions.
     // This is to ensure that the amounts received by the transferred account
@@ -71,12 +77,21 @@ export async function addTransfer(transaction, transferredAccount) {
   const { notes, cleared, schedule } = await runRules(transferTransaction);
   const matchedSchedule = schedule ?? transaction.schedule;
 
-  const id = await db.insertTransaction({
-    ...transferTransaction,
-    notes,
-    cleared,
-    schedule: matchedSchedule,
-  });
+  // Recovery on another client must use the same counterpart UUID.
+  const stableId = replayable
+    ? uuidv5(transaction.id, '90f342be-84fc-4584-a237-315ea380e594')
+    : undefined;
+  const existing = stableId && (await db.select('transactions', stableId));
+  if (existing?.tombstone) return null;
+  const id = existing
+    ? stableId
+    : await db.insertTransaction({
+        id: stableId,
+        ...transferTransaction,
+        notes,
+        cleared,
+        schedule: matchedSchedule,
+      });
 
   await db.updateTransaction({
     id: transaction.id,
@@ -137,11 +152,11 @@ export async function updateTransfer(transaction, transferredAccount) {
   }
 }
 
-export async function onInsert(transaction) {
+export async function onInsert(transaction, replayable = false) {
   const transferredAccount = await getTransferredAccount(transaction);
 
   if (transferredAccount) {
-    return addTransfer(transaction, transferredAccount);
+    return addTransfer(transaction, transferredAccount, replayable);
   }
 }
 
@@ -151,7 +166,7 @@ export async function onDelete(transaction) {
   }
 }
 
-export async function onUpdate(transaction) {
+export async function onUpdate(transaction, replayable = false) {
   const transferredAccount = await getTransferredAccount(transaction);
 
   if (transaction.is_parent) {
@@ -159,7 +174,7 @@ export async function onUpdate(transaction) {
   }
 
   if (transferredAccount && !transaction.transfer_id) {
-    return addTransfer(transaction, transferredAccount);
+    return addTransfer(transaction, transferredAccount, replayable);
   }
 
   if (!transferredAccount && transaction.transfer_id) {

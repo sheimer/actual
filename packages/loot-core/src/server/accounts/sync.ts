@@ -3,21 +3,25 @@ import * as dateFns from 'date-fns';
 import { v4 as uuidv4 } from 'uuid';
 
 import * as asyncStorage from '#platform/server/asyncStorage';
+import * as fs from '#platform/server/fs';
 import { logger } from '#platform/server/log';
 import { aqlQuery } from '#server/aql';
 import * as db from '#server/db';
 import { TRANSACTION_SORT_INCREMENT } from '#server/db/sort';
+import { decrypt, encrypt } from '#server/encryption';
 import { TransactionError } from '#server/errors';
 import { runMutator } from '#server/mutators';
 import { post } from '#server/post';
+import { getPrefs } from '#server/prefs';
 import { getServer } from '#server/server-config';
-import { batchMessages } from '#server/sync';
+import { batchMessages, checkSyncingMode, fullSync } from '#server/sync';
 import { batchUpdateTransactions } from '#server/transactions';
 import { runRules } from '#server/transactions/transaction-rules';
 import {
   defaultMappings,
   mappingsFromString,
 } from '#server/util/custom-sync-mapping';
+import { sequential } from '#shared/async';
 import * as monthUtils from '#shared/months';
 import { q } from '#shared/query';
 import {
@@ -35,7 +39,17 @@ import type {
   TransactionEntity,
 } from '#types/models';
 
-import { getStartingBalancePayee } from './payees';
+import {
+  EnableBankingReviewRequired,
+  planEnableBankingMatches,
+} from './enable-banking-match';
+import type {
+  Choice,
+  EnableBankingMatching,
+  EnableBankingPayment,
+  Review,
+} from './enable-banking-match';
+import { getStartingBalanceCategory, getStartingBalancePayee } from './payees';
 import { title } from './title';
 
 function BankSyncError(type: string, code: string, details?: object) {
@@ -357,6 +371,47 @@ async function downloadAkahuTransactions(
   return retVal;
 }
 
+const getEnableBankingDeviceId = sequential(async () => {
+  const existing = await asyncStorage.getItem('enable-banking-import-device');
+  if (existing) return existing;
+  const id = uuidv4();
+  await asyncStorage.setItem('enable-banking-import-device', id);
+  return id;
+});
+
+async function checkEnableBankingImportDevice(
+  accountId: string,
+  claim = false,
+) {
+  const server = getServer();
+  const token = await asyncStorage.getItem('user-token');
+  if (!server || !token) {
+    throw BankSyncError(
+      'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+      'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+    );
+  }
+  const response = await post(
+    server.ENABLEBANKING_SERVER + '/import-device',
+    { accountId, deviceId: await getEnableBankingDeviceId(), claim },
+    { 'X-ACTUAL-TOKEN': token },
+  );
+  if (response.error_code) {
+    throw BankSyncError(response.error_type, response.error_code);
+  }
+}
+
+export async function claimEnableBankingImportDevice(id: string) {
+  const account = await db.select('accounts', id);
+  if (!isLinkedEnableBankingAccount(account)) {
+    throw new Error('The bank account is no longer linked.');
+  }
+  if (!sharedImportScope(account)) {
+    await checkEnableBankingImportDevice(account.account_id, true);
+  }
+  return 'ok';
+}
+
 async function downloadEnableBankingTransactions(
   acctId: string,
   since: string,
@@ -373,6 +428,7 @@ async function downloadEnableBankingTransactions(
       accountId: acctId,
       startDate: since,
       aspspName,
+      deviceId: await getEnableBankingDeviceId(),
     },
     {
       'X-ACTUAL-TOKEN': userToken,
@@ -393,7 +449,8 @@ async function downloadEnableBankingTransactions(
   return {
     transactions: all,
     accountBalance: balances,
-    startingBalance,
+    // A missing balance is different from a reported balance of zero.
+    startingBalance: startingBalance ?? null,
   };
 }
 
@@ -599,30 +656,46 @@ async function normalizeBankSyncTransactions(transactions, acctId) {
   return { normalized, payeesToCreate };
 }
 
-async function createNewPayees(payeesToCreate, addsAndUpdates) {
+function usedPayees(payeesToCreate, addsAndUpdates) {
   const usedPayeeIds = new Set(addsAndUpdates.map(t => t.payee));
+  return [...payeesToCreate.values()].filter(payee =>
+    usedPayeeIds.has(payee.id),
+  );
+}
 
+async function createNewPayees(payeesToCreate, addsAndUpdates) {
   await batchMessages(async () => {
-    for (const payee of payeesToCreate.values()) {
-      // Only create the payee if it ended up being used
-      if (usedPayeeIds.has(payee.id)) {
-        await db.insertPayee(payee);
-      }
+    for (const payee of usedPayees(payeesToCreate, addsAndUpdates)) {
+      await db.insertPayee(payee);
     }
   });
 }
 
 export type MatchTransactionsOptions = {
   isBankSyncAccount?: boolean;
+  enableBanking?: EnableBankingMatching;
   strictIdChecking?: boolean;
   reimportDeleted?: boolean;
   payeeNameNormalization?: PayeeNameNormalization;
+};
+
+type ImportPlan = {
+  added: TransactionEntity[];
+  updated: Array<{
+    changes: Partial<TransactionEntity> & { id: string };
+    before: TransactionEntity;
+  }>;
+  payees: Array<Pick<db.DbPayee, 'id' | 'name'>>;
+  decisions?: EnableBankingMatching['remembered'];
+  balance?: number;
+  finishedAt?: string;
 };
 
 export type ReconcileTransactionsOptions = MatchTransactionsOptions & {
   isPreview?: boolean;
   defaultCleared?: boolean;
   updateDates?: boolean;
+  importPlan?: ImportPlan;
 };
 
 export type ReconcileTransactionsResult = {
@@ -641,12 +714,14 @@ export async function reconcileTransactions(
   transactions,
   {
     isBankSyncAccount = false,
+    enableBanking,
     strictIdChecking = true,
     isPreview = false,
     defaultCleared = true,
     updateDates = false,
     reimportDeleted,
     payeeNameNormalization,
+    importPlan,
   }: ReconcileTransactionsOptions = {},
 ): Promise<ReconcileTransactionsResult> {
   logger.log('Performing transaction reconciliation');
@@ -663,13 +738,14 @@ export async function reconcileTransactions(
     transactionsStep3,
   } = await matchTransactions(acctId, transactions, {
     isBankSyncAccount,
+    enableBanking,
     strictIdChecking,
     reimportDeleted,
     payeeNameNormalization,
   });
 
   // Finally, generate & commit the changes
-  for (const { trans, subtransactions, match } of transactionsStep3) {
+  for (const { trans, subtransactions, match, newId } of transactionsStep3) {
     // A skipped transaction still takes part in the matching above, so the
     // other transactions match the same way as in the import preview. It is
     // not imported or merged.
@@ -765,7 +841,7 @@ export async function reconcileTransactions(
       const { forceAddTransaction: _forceAddTransaction, ...newTrans } = trans;
       const finalTransaction = {
         ...newTrans,
-        id: uuidv4(),
+        id: newId ?? uuidv4(),
         category: trans.category || null,
         cleared: trans.cleared ?? defaultCleared,
       };
@@ -784,19 +860,30 @@ export async function reconcileTransactions(
     t.sort_order ??= now - index * TRANSACTION_SORT_INCREMENT;
   });
 
-  if (!isPreview) {
+  if (importPlan) {
+    importPlan.added.push(...added);
+    for (const changes of updated) {
+      const before = await db.getTransaction(changes.id);
+      if (before) importPlan.updated.push({ changes, before });
+    }
+    importPlan.payees.push(
+      ...usedPayees(payeesToCreate, [...added, ...updated]),
+    );
+  } else if (!isPreview) {
     await createNewPayees(payeesToCreate, [...added, ...updated]);
     await batchUpdateTransactions({ added, updated });
   }
 
-  logger.log('Debug data for the operations:', {
-    transactionsStep1,
-    transactionsStep2,
-    transactionsStep3,
-    added,
-    updated,
-    updatedPreview,
-  });
+  if (!enableBanking) {
+    logger.log('Debug data for the operations:', {
+      transactionsStep1,
+      transactionsStep2,
+      transactionsStep3,
+      added,
+      updated,
+      updatedPreview,
+    });
+  }
 
   return {
     added: added.map(trans => trans.id),
@@ -837,6 +924,7 @@ export async function matchTransactions(
   transactions,
   {
     isBankSyncAccount = false,
+    enableBanking,
     strictIdChecking = true,
     reimportDeleted: reimportDeletedOverride,
     payeeNameNormalization,
@@ -865,6 +953,35 @@ export async function matchTransactions(
   // The first pass runs the rules, and preps data for fuzzy matching
   const accounts: db.DbAccount[] = await db.getAccounts();
   const accountsMap = new Map(accounts.map(account => [account.id, account]));
+
+  if (enableBanking) {
+    const assignments = await planEnableBankingMatches(
+      acctId,
+      normalized.map(({ trans }) => JSON.parse(trans.raw_synced_data)),
+      reimportDeleted,
+      enableBanking,
+    );
+    const planned = [];
+    for (const [index, item] of normalized.entries()) {
+      const { match, skip, newId } = assignments[index];
+      const trans = skip
+        ? { ...item.trans, skipTransaction: true }
+        : await runRules(item.trans, accountsMap);
+      planned.push({
+        ...item,
+        trans,
+        match,
+        newId,
+        subtransactions: trans.subtransactions || item.subtransactions,
+      });
+    }
+    return {
+      payeesToCreate,
+      transactionsStep1: planned,
+      transactionsStep2: planned,
+      transactionsStep3: planned,
+    };
+  }
 
   const transactionsStep1 = [];
   for (const {
@@ -982,6 +1099,7 @@ export async function matchTransactions(
       subtransactions: trans.subtransactions || subtransactions,
       match,
       fuzzyDataset,
+      newId: undefined,
     });
   }
 
@@ -1110,6 +1228,8 @@ async function processBankSyncDownload(
   initialSync = false,
   customStartingBalance?: number,
   customStartingDate?: string,
+  enableBanking?: EnableBankingMatching,
+  importPlan?: ImportPlan,
 ) {
   // If syncing an account from sync source it must not use strictIdChecking. This allows
   // the fuzzy search to match transactions where the import IDs are different. It is a known quirk
@@ -1155,7 +1275,10 @@ async function processBankSyncDownload(
         currentBalance,
       );
       balanceToUse = Math.round(previousBalance);
-    } else if (acctRow.account_sync_source === 'enableBanking') {
+    } else if (
+      acctRow.account_sync_source === 'enableBanking' &&
+      currentBalance !== null
+    ) {
       const importPending = await aqlQuery(
         q('preferences')
           .filter({ id: `sync-import-pending-${id}` })
@@ -1190,10 +1313,25 @@ async function processBankSyncDownload(
       startingBalanceDate = monthUtils.currentDay();
     }
 
-    const payee = await getStartingBalancePayee();
-
-    return runMutator(async () => {
-      const initialId = await db.insertTransaction({
+    async function addStartingBalance() {
+      // A missing bank balance cannot be used to derive an opening balance.
+      if (balanceToUse === null) return null;
+      const payee = importPlan
+        ? {
+            id: (
+              await db.first<Pick<db.DbPayee, 'id'>>(
+                "SELECT id FROM payees WHERE UNICODE_LOWER(name) = 'starting balance' AND tombstone = 0",
+              )
+            )?.id,
+            category: await getStartingBalanceCategory(),
+          }
+        : await getStartingBalancePayee();
+      if (!payee.id && importPlan) {
+        payee.id = uuidv4();
+        importPlan.payees.push({ id: payee.id, name: 'Starting Balance' });
+      }
+      const transaction = {
+        id: uuidv4(),
         account: id,
         amount: balanceToUse,
         category: acctRow.offbudget === 0 ? payee.category : null,
@@ -1201,18 +1339,28 @@ async function processBankSyncDownload(
         date: startingBalanceDate,
         cleared: true,
         starting_balance_flag: true,
-      });
-
-      const result = await reconcileTransactions(id, transactions, {
-        isBankSyncAccount: true,
-        strictIdChecking: useStrictIdChecking,
-        updateDates,
-      });
-      return {
-        ...result,
-        added: [initialId, ...result.added],
       };
+      if (importPlan) {
+        importPlan.added.push(transaction);
+        return transaction.id;
+      }
+      return db.insertTransaction(transaction);
+    }
+
+    // Enable Banking plans the entire import before writing any transaction.
+    let initialId = enableBanking ? null : await addStartingBalance();
+    const result = await reconcileTransactions(id, transactions, {
+      isBankSyncAccount: true,
+      enableBanking,
+      strictIdChecking: useStrictIdChecking,
+      updateDates,
+      importPlan,
     });
+    if (enableBanking) initialId = await addStartingBalance();
+    return {
+      ...result,
+      added: initialId === null ? result.added : [initialId, ...result.added],
+    };
   }
 
   const transactions = originalTransactions.map(trans => ({
@@ -1220,24 +1368,665 @@ async function processBankSyncDownload(
     account: id,
   }));
 
-  return runMutator(async () => {
-    const result = await reconcileTransactions(
-      id,
-      importTransactions ? transactions : [],
-      {
-        isBankSyncAccount: true,
-        strictIdChecking: useStrictIdChecking,
-        updateDates,
-      },
-    );
+  const result = await reconcileTransactions(
+    id,
+    importTransactions ? transactions : [],
+    {
+      isBankSyncAccount: true,
+      enableBanking,
+      strictIdChecking: useStrictIdChecking,
+      updateDates,
+      importPlan,
+    },
+  );
 
-    if (currentBalance != null) {
-      await updateAccountBalance(id, currentBalance);
+  if (currentBalance != null) {
+    if (importPlan) importPlan.balance = currentBalance;
+    else await updateAccountBalance(id, currentBalance);
+  }
+
+  return result;
+}
+
+type EnableBankingDownload = {
+  transactions: EnableBankingPayment[];
+  startingBalance: number | null;
+};
+
+type PendingEnableBankingImport = {
+  revision: string;
+  download: EnableBankingDownload;
+  initialSync: boolean;
+  customStartingBalance?: number;
+  customStartingDate?: string;
+  review: Review;
+  snapshot: string;
+};
+
+function enableBankingConnection(account: db.DbAccount) {
+  return JSON.stringify([account.id, account.bank, account.account_id]);
+}
+
+function pendingEnableBankingPath(account: db.DbAccount) {
+  const id = getPrefs()?.id;
+  if (!id) throw new Error('No budget is open.');
+  return fs.join(
+    fs.getBudgetDir(id),
+    `enable-banking-${encodeURIComponent(account.id)}.json`,
+  );
+}
+
+async function readPendingEnableBankingImport(account: db.DbAccount) {
+  const path = pendingEnableBankingPath(account);
+  if (!(await fs.exists(path))) return null;
+  let contents: string;
+  try {
+    contents = await fs.readFile(path);
+  } catch (error) {
+    // The review can finish while the UI is reading its preview.
+    if (!(await fs.exists(path))) return null;
+    throw error;
+  }
+  const data: PendingEnableBankingImport & { connection: string } =
+    JSON.parse(contents);
+  return data.connection === enableBankingConnection(account) ? data : null;
+}
+
+async function writePendingEnableBankingImport(
+  account: db.DbAccount,
+  pending: PendingEnableBankingImport,
+) {
+  await fs.writeFile(
+    pendingEnableBankingPath(account),
+    JSON.stringify({
+      ...pending,
+      connection: enableBankingConnection(account),
+    }),
+  );
+}
+
+async function clearPendingEnableBankingImport(account: db.DbAccount) {
+  const path = pendingEnableBankingPath(account);
+  if (await fs.exists(path)) await fs.removeFile(path);
+}
+
+function enableBankingDecisionPrefix(account: db.DbAccount) {
+  return `enable-banking-decision-${enableBankingConnection(account)}-`;
+}
+
+async function getEnableBankingDecisions(account: db.DbAccount) {
+  const prefix = enableBankingDecisionPrefix(account);
+  const rows = await db.all<Pick<db.DbPreference, 'value'>>(
+    'SELECT value FROM preferences WHERE substr(id, 1, ?) = ? AND value IS NOT NULL',
+    [prefix.length, prefix],
+  );
+  return rows.map(row =>
+    JSON.parse(row.value),
+  ) as EnableBankingMatching['remembered'];
+}
+
+function reviewRequired() {
+  return BankSyncError(
+    'ACCOUNT_NEEDS_ATTENTION',
+    'ENABLE_BANKING_REVIEW_REQUIRED',
+  );
+}
+
+function isLinkedEnableBankingAccount(
+  account: db.DbAccount | undefined,
+): account is db.DbAccount {
+  return (
+    !!account &&
+    !account.tombstone &&
+    !account.closed &&
+    String(account.account_sync_source) === 'enableBanking' &&
+    !!account.account_id &&
+    !!account.bank
+  );
+}
+
+export async function clearEnableBankingImportState(account: db.DbAccount) {
+  if (String(account.account_sync_source) !== 'enableBanking') return;
+  await clearPendingEnableBankingImport(account);
+  const prefix = enableBankingDecisionPrefix(account);
+  const rows = await db.all<Pick<db.DbPreference, 'id'>>(
+    'SELECT id FROM preferences WHERE substr(id, 1, ?) = ? AND value IS NOT NULL',
+    [prefix.length, prefix],
+  );
+  await batchMessages(async () => {
+    for (const { id } of rows) {
+      await db.update('preferences', { id, value: null });
     }
-
-    return result;
   });
 }
+
+type SharedDownload = Pick<
+  PendingEnableBankingImport,
+  'download' | 'initialSync' | 'customStartingDate' | 'customStartingBalance'
+>['download'] &
+  Pick<
+    PendingEnableBankingImport,
+    'initialSync' | 'customStartingDate' | 'customStartingBalance'
+  >;
+
+type SharedBatch =
+  | { id: string; state: 'open'; download: SharedDownload }
+  | { id: string; state: 'accepted'; plan: string }
+  | { id: string; state: 'completed' };
+
+function sharedImportScope(account: db.DbAccount) {
+  const prefs = getPrefs();
+  return prefs?.cloudFileId && prefs.groupId
+    ? {
+        fileId: prefs.cloudFileId,
+        groupId: prefs.groupId,
+        accountId: account.id,
+        connectionId: account.account_id,
+      }
+    : null;
+}
+
+type SharedScope = NonNullable<ReturnType<typeof sharedImportScope>>;
+
+async function sharedImportRequest<T>(
+  scope: SharedScope,
+  operation: { action: string } & Record<string, unknown>,
+): Promise<T> {
+  const token = await asyncStorage.getItem('user-token');
+  const server = getServer();
+  if (!token || !server) {
+    throw new Error('Connect to the sync server to review this import.');
+  }
+  const response = await post(
+    server.ENABLEBANKING_SERVER + '/shared-import',
+    { ...scope, ...operation },
+    { 'X-ACTUAL-TOKEN': token },
+    60000,
+  );
+  if (response?.error_code) {
+    throw BankSyncError(response.error_type, response.error_code);
+  }
+  return response;
+}
+
+async function readSharedImport(account: db.DbAccount, scope: SharedScope) {
+  const batch = await sharedImportRequest<SharedBatch | null>(scope, {
+    action: 'read',
+  });
+  if (batch) return batch;
+
+  // A device upgrading from the previous release may still own a local
+  // bank response. Publish it as the shared batch without a second download.
+  const pending = await readPendingEnableBankingImport(account);
+  if (!pending) return null;
+  const { initialSync, customStartingDate, customStartingBalance, download } =
+    pending;
+  return sharedImportRequest<SharedBatch | null>(scope, {
+    action: 'adopt',
+    deviceId: await getEnableBankingDeviceId(),
+    download: {
+      ...download,
+      initialSync,
+      customStartingDate,
+      customStartingBalance,
+    },
+  });
+}
+
+async function prepareSharedImport(
+  account: db.DbAccount,
+  batch: Extract<SharedBatch, { state: 'open' }>,
+  confirmation?: { revision: string; choices: Choice[] },
+) {
+  const plan: ImportPlan = { added: [], updated: [], payees: [] };
+  const {
+    initialSync,
+    customStartingBalance,
+    customStartingDate,
+    ...download
+  } = batch.download;
+  const snapshot = confirmation?.revision.startsWith(batch.id + ':')
+    ? confirmation.revision.slice(batch.id.length + 1)
+    : null;
+  try {
+    await processBankSyncDownload(
+      structuredClone(download),
+      account.id,
+      account,
+      initialSync && !(await getAccountOldestTransaction(account.id)),
+      customStartingBalance,
+      customStartingDate,
+      {
+        remembered: await getEnableBankingDecisions(account),
+        resolution: snapshot && {
+          snapshot,
+          choices: confirmation.choices,
+          makeId: uuidv4,
+          remember: entries => {
+            plan.decisions = entries;
+          },
+        },
+      },
+      plan,
+    );
+  } catch (error) {
+    if (!(error instanceof EnableBankingReviewRequired)) throw error;
+    return {
+      review: { ...error.review, revision: batch.id + ':' + error.snapshot },
+    };
+  }
+  return { plan };
+}
+
+async function encodeImportPlan(plan: ImportPlan) {
+  const text = JSON.stringify(plan);
+  const keyId = getPrefs()?.encryptKeyId;
+  if (!keyId) return text;
+  const { value, meta } = await encrypt(Buffer.from(text), keyId);
+  return JSON.stringify({ ciphertext: value.toString('base64'), meta });
+}
+
+async function decodeImportPlan(text: string): Promise<ImportPlan> {
+  const value = JSON.parse(text);
+  const keyId = getPrefs()?.encryptKeyId;
+  if (!keyId) return value;
+  if (value.meta?.keyId !== keyId) {
+    throw new Error('The import key has changed.');
+  }
+  const decoded = await decrypt(
+    Buffer.from(value.ciphertext, 'base64'),
+    value.meta,
+  );
+  return JSON.parse(decoded.toString());
+}
+
+function importReceipt(scope: SharedScope) {
+  return (
+    'enable-banking-completed-' +
+    JSON.stringify([scope.accountId, scope.connectionId])
+  );
+}
+
+function verifySharedAccount(account: db.DbAccount, scope: SharedScope) {
+  const current = sharedImportScope(account);
+  if (
+    !isLinkedEnableBankingAccount(account) ||
+    current?.fileId !== scope.fileId ||
+    current.groupId !== scope.groupId ||
+    current.connectionId !== scope.connectionId
+  ) {
+    throw new Error('The linked account changed while processing the import.');
+  }
+}
+
+async function syncImportBudget(scope: SharedScope) {
+  if (checkSyncingMode('offline') || checkSyncingMode('disabled')) {
+    throw new Error('Budget sync must be enabled to finish the bank import.');
+  }
+  const result = await fullSync();
+  if (
+    'error' in result ||
+    getPrefs()?.cloudFileId !== scope.fileId ||
+    getPrefs()?.groupId !== scope.groupId
+  ) {
+    throw new Error('Could not sync the bank import with the budget server.');
+  }
+}
+
+async function applySharedImport(
+  account: db.DbAccount,
+  scope: SharedScope,
+  id: string,
+  plan: ImportPlan,
+) {
+  const receipt = importReceipt(scope);
+  if ((await db.select('preferences', receipt))?.value === id) {
+    return { added: [], updated: [] };
+  }
+
+  const added: TransactionEntity[] = [];
+  const replayed: string[] = [];
+  for (const transaction of plan.added) {
+    if (transaction.account !== scope.accountId) {
+      throw new Error(
+        'The import plan contains a payment for a different account.',
+      );
+    }
+    const existing = await db.select('transactions', transaction.id);
+    if (!existing) added.push(transaction);
+    else if (!existing.tombstone) replayed.push(transaction.id);
+  }
+
+  const updated: Array<Partial<TransactionEntity> & { id: string }> = [];
+  for (const { changes, before } of plan.updated) {
+    const current: TransactionEntity | undefined = await db.getTransaction(
+      changes.id,
+    );
+    if (
+      !current ||
+      current.tombstone ||
+      current.reconciled ||
+      current.account !== scope.accountId ||
+      current.account !== before.account ||
+      current.amount !== before.amount ||
+      (current.date !== before.date && current.date !== changes.date)
+    ) {
+      continue;
+    }
+    const safeChanges = Object.entries(changes).filter(
+      ([field, value]) =>
+        field !== 'id' &&
+        current[field] !== value &&
+        (current[field] ?? null) === (before[field] ?? null),
+    );
+    if (safeChanges.length > 0) {
+      updated.push({ id: changes.id, ...Object.fromEntries(safeChanges) });
+    }
+  }
+
+  await batchMessages(async () => {
+    for (const payee of plan.payees) {
+      if (!(await db.select('payees', payee.id))) await db.insertPayee(payee);
+    }
+  });
+  await batchUpdateTransactions({ added, updated, replayed });
+  await batchMessages(async () => {
+    const prefix = enableBankingDecisionPrefix(account);
+    for (const decision of plan.decisions ?? []) {
+      await db.update('preferences', {
+        id: prefix + decision.evidence,
+        value: JSON.stringify(decision),
+      });
+    }
+    if (plan.balance != null) {
+      await updateAccountBalance(account.id, plan.balance);
+    }
+    await db.update('accounts', {
+      id: account.id,
+      last_sync: plan.finishedAt,
+      bank_sync_status: 'ok',
+    });
+    await db.update('preferences', { id: receipt, value: id });
+  });
+  return { added: added.map(t => t.id), updated: updated.map(t => t.id) };
+}
+
+type SharedImportAction =
+  | { revision: string; choices: Choice[] }
+  | {
+      startDate: string;
+      aspspName?: string;
+      initialSync: boolean;
+      customStartingDate?: string;
+      customStartingBalance?: number;
+    };
+
+const runSharedImport = sequential(
+  async (
+    account: db.DbAccount,
+    scope: SharedScope,
+    action: SharedImportAction,
+  ): Promise<{
+    result?: { added: string[]; updated: string[] };
+    review?: (Review & { revision: string }) | null;
+  }> => {
+    // Pull any edits and receipts committed by another device before planning.
+    await syncImportBudget(scope);
+    const previous = (await db.select('preferences', importReceipt(scope)))
+      ?.value;
+    const confirmation = 'revision' in action ? action : null;
+    const pending = await readSharedImport(account, scope);
+    const batch =
+      'startDate' in action && (!pending || pending.state === 'completed')
+        ? await sharedImportRequest<SharedBatch | null>(scope, {
+            action: 'download',
+            after: previous,
+            ...action,
+          })
+        : pending;
+    if (!batch || batch.state === 'completed') {
+      if (confirmation) return { review: null };
+      return { result: { added: [], updated: [] } };
+    }
+
+    const outcome = await runMutator(async () => {
+      const current = await db.select('accounts', account.id);
+      verifySharedAccount(current, scope);
+      if (batch.state === 'accepted') {
+        if (confirmation && confirmation.revision !== batch.id) {
+          return { review: null };
+        }
+        const plan = await decodeImportPlan(batch.plan);
+        return {
+          result: await applySharedImport(current, scope, batch.id, plan),
+        };
+      }
+      if (confirmation && !confirmation.revision.startsWith(batch.id + ':')) {
+        return { review: null };
+      }
+      const prepared = await prepareSharedImport(current, batch, confirmation);
+      if (!prepared.plan) {
+        await db.update('accounts', {
+          id: account.id,
+          bank_sync_status: 'attention-required',
+        });
+        return { review: prepared.review };
+      }
+      const plan = { ...prepared.plan, finishedAt: String(Date.now()) };
+      const { won } = await sharedImportRequest<{ won: boolean }>(scope, {
+        action: 'confirm',
+        id: batch.id,
+        plan: await encodeImportPlan(plan),
+      });
+      if (!won) return { review: null };
+      return {
+        result: await applySharedImport(current, scope, batch.id, plan),
+      };
+    });
+    if (outcome.result) {
+      await syncImportBudget(scope);
+      await sharedImportRequest(scope, { action: 'complete', id: batch.id });
+      await clearPendingEnableBankingImport(account);
+    }
+    return outcome;
+  },
+);
+
+export async function getEnableBankingImportReview(id: string) {
+  const account = await db.select('accounts', id);
+  if (!isLinkedEnableBankingAccount(account)) return null;
+  const scope = sharedImportScope(account);
+  if (scope) {
+    const batch = await readSharedImport(account, scope);
+    if (batch?.state === 'accepted') {
+      return { accepted: true as const, revision: batch.id, conflicts: [] };
+    }
+    if (batch?.state === 'open') {
+      return runMutator(async () => {
+        const outcome = await prepareSharedImport(account, batch);
+        return 'review' in outcome ? outcome.review : null;
+      });
+    }
+  }
+  if (scope) return null;
+  const pending = await readPendingEnableBankingImport(account);
+  return pending ? { revision: pending.revision, ...pending.review } : null;
+}
+
+async function applyEnableBankingImport(
+  account: db.DbAccount,
+  pending: Omit<PendingEnableBankingImport, 'revision' | 'review' | 'snapshot'>,
+  confirmation?: { snapshot: string; choices: Choice[] },
+) {
+  const remembered = await getEnableBankingDecisions(account);
+
+  let result: ReconcileTransactionsResult;
+  let updatedDecisions: EnableBankingMatching['remembered'] | undefined;
+  try {
+    result = await processBankSyncDownload(
+      structuredClone(pending.download),
+      account.id,
+      account,
+      pending.initialSync && !(await getAccountOldestTransaction(account.id)),
+      pending.customStartingBalance,
+      pending.customStartingDate,
+      {
+        remembered,
+        resolution: confirmation && {
+          ...confirmation,
+          makeId: uuidv4,
+          remember: entries => {
+            updatedDecisions = entries;
+          },
+        },
+      },
+    );
+  } catch (error) {
+    if (!(error instanceof EnableBankingReviewRequired)) throw error;
+    // Matching detects conflicts before any transaction or balance writes.
+    const review: PendingEnableBankingImport = {
+      ...pending,
+      revision: uuidv4(),
+      snapshot: error.snapshot,
+      review: error.review,
+    };
+    await writePendingEnableBankingImport(account, review);
+    await db.update('accounts', {
+      id: account.id,
+      bank_sync_status: 'attention-required',
+    });
+    return { review: { revision: review.revision, ...review.review } };
+  }
+
+  // Allow the transaction writer's own batches to flush before committing the
+  // review: transfer and split post-processing reads the newly written rows.
+  if (confirmation) {
+    await batchMessages(async () => {
+      const prefix = enableBankingDecisionPrefix(account);
+      for (const decision of updatedDecisions ?? []) {
+        await db.update('preferences', {
+          id: prefix + decision.evidence,
+          value: JSON.stringify(decision),
+        });
+      }
+      await db.update('accounts', {
+        id: account.id,
+        last_sync: String(Date.now()),
+        bank_sync_status: 'ok',
+      });
+    });
+    await clearPendingEnableBankingImport(account);
+  }
+  return { result };
+}
+
+export function resolveEnableBankingImport(
+  id: string,
+  revision: string,
+  choices: Choice[],
+) {
+  return resolveBankImport(id, revision, choices);
+}
+
+async function resolveBankImport(
+  id: string,
+  revision: string,
+  choices: Choice[],
+) {
+  const linked = await db.select('accounts', id);
+  const scope =
+    isLinkedEnableBankingAccount(linked) && sharedImportScope(linked);
+  if (scope) return runSharedImport(linked, scope, { revision, choices });
+
+  return runMutator(async () => {
+    const account = await db.select('accounts', id);
+    if (!isLinkedEnableBankingAccount(account)) {
+      throw new Error('The bank account is no longer linked.');
+    }
+    const pending = await readPendingEnableBankingImport(account);
+    if (!pending || pending.revision !== revision) {
+      throw new Error('The import preview changed. Review it again.');
+    }
+    // An offline ZIP import has no shared budget identity. Shared budgets
+    // must validate ownership even when there is no new bank request.
+    if (getPrefs()?.cloudFileId) {
+      await checkEnableBankingImportDevice(account.account_id);
+    }
+    const outcome = await applyEnableBankingImport(account, pending, {
+      snapshot: pending.snapshot,
+      choices,
+    });
+    if (!outcome.result) return { review: outcome.review };
+    const { added, updated } = outcome.result;
+    return { result: { added, updated } };
+  });
+}
+
+const syncEnableBanking = sequential(
+  async (
+    id: string,
+    acctId: string,
+    since: string,
+    initialSync: boolean,
+    customStartingBalance?: number,
+    customStartingDate?: string,
+  ) => {
+    const account = await db.select('accounts', id);
+    if (!isLinkedEnableBankingAccount(account)) {
+      throw new Error('The bank account is no longer linked.');
+    }
+    if (account.account_id !== acctId) {
+      throw new Error('The bank account changed before downloading.');
+    }
+    const scope = sharedImportScope(account);
+    const bank = await db.select('banks', account.bank);
+    if (scope) {
+      const outcome = await runSharedImport(account, scope, {
+        startDate: since,
+        aspspName: bank?.name,
+        initialSync,
+        customStartingDate,
+        customStartingBalance,
+      });
+      if (!outcome.result) throw reviewRequired();
+      return { ...outcome.result, updatedPreview: [] };
+    }
+    if (await getEnableBankingImportReview(id)) throw reviewRequired();
+    // A client connected to an older server must fail before reaching its
+    // unguarded transactions endpoint.
+    await checkEnableBankingImportDevice(acctId);
+    const download = await downloadEnableBankingTransactions(
+      acctId,
+      since,
+      bank?.name,
+    );
+    if (!download) throw BankSyncError('NO_DATA', 'NO_DATA');
+
+    const applied = await runMutator(async () => {
+      const current = await db.select('accounts', id);
+      if (
+        !isLinkedEnableBankingAccount(current) ||
+        current.bank !== account.bank ||
+        current.account_id !== acctId
+      ) {
+        throw new Error('The bank account changed while downloading.');
+      }
+      if (await getEnableBankingImportReview(id)) throw reviewRequired();
+      const oldest = await getAccountOldestTransaction(id);
+      return applyEnableBankingImport(current, {
+        download: {
+          transactions: download.transactions,
+          startingBalance: download.startingBalance,
+        },
+        initialSync: initialSync && !oldest,
+        customStartingBalance,
+        customStartingDate,
+      });
+    });
+    if (!applied.result) throw reviewRequired();
+    return applied.result;
+  },
+);
 
 export async function syncAccount(
   userId: string | undefined,
@@ -1281,11 +2070,13 @@ export async function syncAccount(
       newAccount,
     );
   } else if (acctRow.account_sync_source === 'enableBanking') {
-    const bankRow = await db.select('banks', acctRow.bank);
-    download = await downloadEnableBankingTransactions(
+    return syncEnableBanking(
+      id,
       acctId,
       syncStartDate,
-      bankRow?.name,
+      newAccount,
+      customStartingBalance,
+      customStartingDate,
     );
   } else {
     throw new Error(
@@ -1293,13 +2084,15 @@ export async function syncAccount(
     );
   }
 
-  return processBankSyncDownload(
-    download,
-    id,
-    acctRow,
-    newAccount,
-    customStartingBalance,
-    customStartingDate,
+  return runMutator(() =>
+    processBankSyncDownload(
+      download,
+      id,
+      acctRow,
+      newAccount,
+      customStartingBalance,
+      customStartingDate,
+    ),
   );
 }
 
@@ -1374,7 +2167,9 @@ export async function simpleFinBatchSync(
     }
 
     promises.push(
-      processBankSyncDownload(download, account.id, acctRow, newAccount)
+      runMutator(() =>
+        processBankSyncDownload(download, account.id, acctRow, newAccount),
+      )
         .then(res => ({
           accountId: account.id,
           res,

@@ -42,6 +42,10 @@ export type ConfirmTransactionEditReason =
 
 export type Modal =
   | {
+      name: 'enablebanking-import-review';
+      options: { accountId: AccountEntity['id'] };
+    }
+  | {
       name: 'import-transactions';
       options: {
         accountId: string;

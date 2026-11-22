@@ -3,6 +3,10 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock all external dependencies before importing the app
+vi.mock('../import-device', () => ({
+  enableBankingImportDeviceError: () => null,
+}));
+
 vi.mock('../../services/secrets-service', () => ({
   SecretName: {
     enablebanking_applicationId: 'enablebanking_applicationId',
@@ -482,7 +486,7 @@ describe('Enable Banking Express routes', () => {
       expect(mockFetch).toHaveBeenCalledTimes(3);
     });
 
-    it('returns startingBalance 0 when no balances available', async () => {
+    it('returns a null startingBalance when no balances are reported', async () => {
       mockFetchResponse({ balances: [] });
       mockFetchResponse({ transactions: [] });
 
@@ -490,10 +494,13 @@ describe('Enable Banking Express routes', () => {
         .post('/transactions')
         .send({ accountId: 'uid-1', startDate: '2026-01-01' });
 
-      expect(res.body.data.startingBalance).toBe(0);
+      expect(res.body.data.startingBalance).toBeNull();
     });
 
     it('handles API error gracefully', async () => {
+      // A balance failure is tolerated, so the error has to come from the
+      // transactions call.
+      mockFetchResponse({ balances: [] });
       mockFetchResponse({ message: 'Session expired' }, false, 401);
 
       const res = await request(app)
@@ -506,6 +513,9 @@ describe('Enable Banking Express routes', () => {
     });
 
     it('returns structured error for rate limit (429)', async () => {
+      // A balance failure is tolerated, so the error has to come from the
+      // transactions call.
+      mockFetchResponse({ balances: [] });
       mockFetchResponse({ message: 'Rate limit exceeded' }, false, 429);
 
       const res = await request(app)
@@ -518,6 +528,9 @@ describe('Enable Banking Express routes', () => {
     });
 
     it('maps 404 to INVALID_INPUT category in error_type', async () => {
+      // A balance failure is tolerated, so the error has to come from the
+      // transactions call.
+      mockFetchResponse({ balances: [] });
       mockFetchResponse({ message: 'Account not found' }, false, 404);
 
       const res = await request(app)
