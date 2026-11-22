@@ -17,6 +17,7 @@ import { app as accountsApp } from './app';
 import {
   addTransactions,
   compareFuzzyMatchCandidates,
+  matchTransactions,
   reconcileTransactions,
   simpleFinBatchSync,
 } from './sync';
@@ -671,6 +672,98 @@ describe('Account sync', () => {
     ).toBe(-1239);
   });
 
+  describe('bank sync with unstable provider IDs', () => {
+    function payment(transactionId: string, payeeName: string, amount: string) {
+      return {
+        transactionId,
+        date: '2026-01-12',
+        payeeName,
+        transactionAmount: { amount, currency: 'EUR' },
+        booked: true,
+      };
+    }
+
+    const options = {
+      isBankSyncAccount: true,
+      strictIdChecking: false,
+      enableBanking: { remembered: [] },
+    };
+
+    test('a reused ID does not replace an unrelated payment', async () => {
+      const { id } = await prepareDatabase();
+      await reconcileTransactions(
+        id,
+        [payment('synthetic-day.0', 'Synthetic Bakery', '-12.00')],
+        options,
+      );
+      const [original] = await getAllTransactions();
+
+      await reconcileTransactions(
+        id,
+        [payment('synthetic-day.0', 'Synthetic Books', '-27.00')],
+        options,
+      );
+
+      const transactions = await getAllTransactions();
+      expect(transactions).toHaveLength(2);
+      expect(transactions.find(t => t.id === original.id)).toMatchObject({
+        amount: -1200,
+        imported_payee: 'Synthetic Bakery',
+      });
+      expect(transactions.map(t => t.amount).sort((a, b) => a - b)).toEqual([
+        -2700, -1200,
+      ]);
+    });
+
+    test('shifted IDs preserve existing UUIDs and add the new payment once', async () => {
+      const { id } = await prepareDatabase();
+      await reconcileTransactions(
+        id,
+        [payment('synthetic-day.0', 'Synthetic Bakery', '-12.00')],
+        options,
+      );
+      const [original] = await getAllTransactions();
+      const response = () => [
+        payment('synthetic-day.0', 'Synthetic Books', '-27.00'),
+        payment('synthetic-day.1', 'Synthetic Bakery', '-12.00'),
+      ];
+
+      await reconcileTransactions(id, response(), options);
+      await reconcileTransactions(id, response(), options);
+
+      const transactions = await getAllTransactions();
+      expect(transactions).toHaveLength(2);
+      expect(transactions.find(t => t.id === original.id)).toMatchObject({
+        amount: -1200,
+        imported_payee: 'Synthetic Bakery',
+      });
+      expect(transactions.map(t => t.amount).sort((a, b) => a - b)).toEqual([
+        -2700, -1200,
+      ]);
+    });
+
+    test('two payments with the same provider ID cannot consume one UUID twice', async () => {
+      const { id } = await prepareDatabase();
+      await reconcileTransactions(
+        id,
+        [payment('synthetic-day.0', 'Synthetic Bakery', '-12.00')],
+        options,
+      );
+      const { transactionsStep3 } = await matchTransactions(
+        id,
+        [
+          payment('synthetic-day.0', 'Synthetic Bakery', '-12.00'),
+          payment('synthetic-day.0', 'Synthetic Books', '-27.00'),
+        ],
+        options,
+      );
+      const matchedIds = transactionsStep3
+        .filter(data => data.match)
+        .map(data => data.match.id);
+      expect(new Set(matchedIds).size).toBe(matchedIds.length);
+    });
+  });
+
   describe('compareFuzzyMatchCandidates', () => {
     const transDate = '2024-04-05';
     const alreadyImported = {
@@ -1301,6 +1394,285 @@ describe('SimpleFin batch sync', () => {
 });
 
 describe('Enable Banking sync', () => {
+  async function setupEnableBankingAccount() {
+    vi.mocked(asyncStorage.getItem).mockResolvedValue('test-token');
+    vi.mocked(asyncStorage.multiGet).mockResolvedValue({
+      'user-id': 'user-1',
+      'user-key': 'key-1',
+    });
+    db.runQuery(
+      'INSERT INTO banks (id, bank_id, name, tombstone) VALUES (?, ?, ?, 0)',
+      ['bank-eb', 'eb-acct-1', 'Enable Bank'],
+    );
+    const id = await db.insertAccount({
+      id: 'acct-eb-1',
+      account_id: 'eb-acct-1',
+      name: 'Checking',
+      bank: 'bank-eb',
+      account_sync_source: 'enableBanking',
+    });
+    await db.insertPayee({ id: 'transfer-' + id, name: '', transfer_acct: id });
+    return id;
+  }
+
+  function payment(transactionId: string, payeeName: string, amount: string) {
+    return {
+      transactionId,
+      date: '2017-10-02',
+      payeeName,
+      transactionAmount: { amount, currency: 'EUR' },
+      booked: true,
+    };
+  }
+
+  function mockBankResponse(
+    transactions: ReturnType<typeof payment>[],
+    startingBalance: number | null = null,
+  ) {
+    const fetch = vi.fn(() => ({
+      transactions: { all: transactions, booked: transactions, pending: [] },
+      balances: [],
+      startingBalance,
+    }));
+    handlers['/enablebanking/transactions'] = fetch;
+    return fetch;
+  }
+
+  test.each(['match', 'add', 'skip'] as const)(
+    'retains a conflicting batch and reuses the %s decision after the ID changes',
+    async action => {
+      const id = await setupEnableBankingAccount();
+      const sync = () =>
+        accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+      const getReview = () =>
+        accountsApp.handlers['enablebanking-import-review']({ id });
+      mockBankResponse([payment('a', 'Synthetic Shop', '-12.34')]);
+      expect((await sync()).errors).toHaveLength(0);
+      const before = await getAllTransactions();
+      const originalId = before[0].id;
+      const accountBefore = await db.select('accounts', id);
+
+      const fetch = mockBankResponse(
+        [
+          payment('a', 'Synthetic Shop expanded descriptor', '-12.34'),
+          payment('b', 'Synthetic Books', '-27.00'),
+        ],
+        12000,
+      );
+      expect((await sync()).errors).toMatchObject([
+        { code: 'ENABLE_BANKING_REVIEW_REQUIRED' },
+      ]);
+      expect(await getAllTransactions()).toEqual(before);
+      expect(await db.select('accounts', id)).toMatchObject({
+        last_sync: accountBefore.last_sync,
+        balance_current: accountBefore.balance_current,
+        bank_sync_status: 'attention-required',
+      });
+      const review = await getReview();
+      expect(review?.conflicts).toMatchObject([
+        { index: 0, candidates: [{ id: originalId }] },
+      ]);
+
+      // A further sync while a review is open does not consume another bank call.
+      expect((await sync()).errors).toMatchObject([
+        { code: 'ENABLE_BANKING_REVIEW_REQUIRED' },
+      ]);
+      expect(fetch).toHaveBeenCalledTimes(1);
+
+      const resolved = await accountsApp.handlers[
+        'enablebanking-import-resolve'
+      ]({
+        id,
+        revision: review!.revision,
+        choices:
+          action === 'match'
+            ? [{ index: 0, action, transactionId: originalId }]
+            : [{ index: 0, action }],
+      });
+      expect(resolved).toHaveProperty('result');
+      expect(await db.select('accounts', id)).toMatchObject({
+        balance_current: 12000,
+        bank_sync_status: 'ok',
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(await getReview()).toBeNull();
+      const after = await getAllTransactions();
+      expect(after).toHaveLength(action === 'add' ? 3 : 2);
+      expect(after.find(row => row.id === originalId)).toMatchObject({
+        imported_payee:
+          action === 'match'
+            ? 'Synthetic Shop expanded descriptor'
+            : 'Synthetic Shop',
+      });
+
+      mockBankResponse([
+        payment('shifted-a', 'Synthetic Shop expanded descriptor', '-12.34'),
+        payment('shifted-b', 'Synthetic Books', '-27.00'),
+      ]);
+      expect((await sync()).errors).toHaveLength(0);
+      expect(await getReview()).toBeNull();
+      expect((await getAllTransactions()).map(t => t.id)).toEqual(
+        after.map(t => t.id),
+      );
+    },
+  );
+
+  test('refreshes a stale review without downloading again', async () => {
+    const id = await setupEnableBankingAccount();
+    const sync = () =>
+      accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+    const getReview = () =>
+      accountsApp.handlers['enablebanking-import-review']({ id });
+    const resolve = accountsApp.handlers['enablebanking-import-resolve'];
+    mockBankResponse([payment('a', 'Synthetic Shop', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    const [original] = await getAllTransactions();
+    const fetch = mockBankResponse([
+      payment('a', 'Synthetic Other Shop', '-12.34'),
+    ]);
+    expect((await sync()).errors).toMatchObject([
+      { code: 'ENABLE_BANKING_REVIEW_REQUIRED' },
+    ]);
+    const review = await getReview();
+
+    await db.deleteTransaction(original);
+    const before = await getAllTransactions();
+    const refreshed = await resolve({
+      id,
+      revision: review!.revision,
+      choices: [{ index: 0, action: 'match', transactionId: original.id }],
+    });
+    expect(refreshed).toMatchObject({ review: { conflicts: [] } });
+    expect(await getAllTransactions()).toEqual(before);
+    const freshReview = await getReview();
+    expect(freshReview?.revision).not.toBe(review?.revision);
+    await expect(
+      resolve({ id, revision: review!.revision, choices: [] }),
+    ).rejects.toThrow('preview changed');
+    expect(
+      await resolve({ id, revision: freshReview!.revision, choices: [] }),
+    ).toHaveProperty('result');
+    expect(await getReview()).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(
+      (await getAllTransactions()).filter(row => !row.tombstone),
+    ).toHaveLength(1);
+  });
+
+  test('normal transfer processing keeps both sides on overlapping downloads', async () => {
+    const id = await setupEnableBankingAccount();
+    const savings = await db.insertAccount({ name: 'Synthetic Savings' });
+    await db.insertPayee({ name: 'To Savings', transfer_acct: savings });
+    const sync = () =>
+      accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+
+    mockBankResponse([payment('first-id', 'To Savings', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    const before = await getAllTransactions();
+    const outgoing = before.find(row => row.account === id);
+    const incoming = before.find(row => row.account === savings);
+    expect(outgoing).toMatchObject({
+      amount: -1234,
+      transfer_id: incoming?.id,
+    });
+    expect(incoming).toMatchObject({ amount: 1234, transfer_id: outgoing?.id });
+
+    mockBankResponse([payment('changed-id', 'To Savings', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    expect(await getAllTransactions()).toEqual(
+      before.map(row =>
+        row.id === outgoing?.id ? { ...row, imported_id: 'changed-id' } : row,
+      ),
+    );
+  });
+
+  test('a split child cannot consume a new bank posting with the same amount', async () => {
+    const id = await setupEnableBankingAccount();
+    const sync = () =>
+      accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+    mockBankResponse([payment('parent.0', 'Synthetic Shop', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    const [parent] = await getAllTransactions();
+    await db.updateTransaction({ id: parent.id, is_parent: true });
+    const child = await db.insertTransaction({
+      account: id,
+      date: '2017-10-02',
+      amount: -234,
+      is_child: true,
+      parent_id: parent.id,
+    });
+    await db.insertTransaction({
+      account: id,
+      date: '2017-10-02',
+      amount: -1000,
+      is_child: true,
+      parent_id: parent.id,
+    });
+    mockBankResponse([
+      payment('parent.1', 'Synthetic Shop', '-12.34'),
+      payment('new', 'Synthetic Books', '-2.34'),
+    ]);
+    const result = await sync();
+    expect(result.errors).toHaveLength(0);
+    expect(result.newTransactions).toHaveLength(1);
+    const rows = await getAllTransactions();
+    expect(rows.find(row => row.id === child)).toMatchObject({
+      parent_id: parent.id,
+      imported_id: null,
+    });
+    expect(
+      rows.find(row => row.id === result.newTransactions[0]),
+    ).toMatchObject({ amount: -234, parent_id: null });
+  });
+
+  test('a reconciled posting keeps its UUID and source metadata', async () => {
+    const id = await setupEnableBankingAccount();
+    const sync = () =>
+      accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+    mockBankResponse([payment('a', 'Synthetic Shop', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    const [original] = await getAllTransactions();
+    await db.updateTransaction({
+      id: original.id,
+      reconciled: true,
+      notes: 'My note',
+    });
+    const before = await getAllTransactions();
+    mockBankResponse([payment('changed', 'Synthetic Shop', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    expect(await getAllTransactions()).toEqual(before);
+  });
+
+  test('preserves identical postings and requests a review of a partial response', async () => {
+    const id = await setupEnableBankingAccount();
+    const sync = () =>
+      accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+    const response = [
+      payment('same.0', 'Synthetic Ticket', '-10.00'),
+      payment('same.1', 'Synthetic Ticket', '-10.00'),
+    ];
+    mockBankResponse(response);
+    expect((await sync()).errors).toHaveLength(0);
+    const before = await getAllTransactions();
+    expect(before).toHaveLength(2);
+    expect((await sync()).errors).toHaveLength(0);
+    expect(await getAllTransactions()).toEqual(before);
+
+    mockBankResponse([response[0]]);
+    expect((await sync()).errors).toMatchObject([
+      { code: 'ENABLE_BANKING_REVIEW_REQUIRED' },
+    ]);
+    const review = await accountsApp.handlers['enablebanking-import-review']({
+      id,
+    });
+    expect(
+      review?.conflicts[0].candidates
+        .map(row => row.id)
+        .sort((a, b) => a.localeCompare(b)),
+    ).toEqual(before.map(row => row.id).sort((a, b) => a.localeCompare(b)));
+    expect(await getAllTransactions()).toEqual(before);
+  });
+
   afterEach(() => {
     delete handlers['/enablebanking/transactions'];
   });
@@ -1311,28 +1683,7 @@ describe('Enable Banking sync', () => {
   ])(
     'imports transactions without an opening balance when the bank %s',
     async (_case, startingBalance) => {
-      vi.mocked(asyncStorage.getItem).mockResolvedValue('test-token');
-      vi.mocked(asyncStorage.multiGet).mockResolvedValue({
-        'user-id': 'user-1',
-        'user-key': 'key-1',
-      });
-
-      db.runQuery(
-        'INSERT INTO banks (id, bank_id, name, tombstone) VALUES (?, ?, ?, 0)',
-        ['bank-eb', 'eb-acct-1', 'Enable Bank'],
-      );
-      const acctId = await db.insertAccount({
-        id: 'acct-eb-1',
-        account_id: 'eb-acct-1',
-        name: 'Checking',
-        bank: 'bank-eb',
-        account_sync_source: 'enableBanking',
-      });
-      await db.insertPayee({
-        id: 'transfer-' + acctId,
-        name: '',
-        transfer_acct: acctId,
-      });
+      const acctId = await setupEnableBankingAccount();
 
       const transaction = {
         transactionId: 'eb-tx-1',

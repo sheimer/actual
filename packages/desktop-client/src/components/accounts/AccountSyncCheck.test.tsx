@@ -64,6 +64,37 @@ describe('AccountSyncCheck', () => {
     });
   });
 
+  it('opens the bank import review from persisted attention status', async () => {
+    vi.mocked(useAccounts).mockReturnValue({
+      data: [
+        {
+          ...baseAccount,
+          account_sync_source: 'enableBanking',
+          bank_sync_status: 'attention-required',
+        },
+      ],
+      isLoading: false,
+    } as ReturnType<typeof useAccounts>);
+    vi.mocked(useFailedAccounts).mockReturnValue(new Map());
+
+    render(
+      <TestProviders>
+        <AccountSyncCheck />
+      </TestProviders>,
+    );
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Review bank import' }),
+    );
+    expect(mockDispatch).toHaveBeenCalledWith(
+      pushModal({
+        modal: {
+          name: 'enablebanking-import-review',
+          options: { accountId: 'acc-1' },
+        },
+      }),
+    );
+  });
+
   it('renders clear error message and Configure button when GoCardless credentials are missing', async () => {
     vi.mocked(useFailedAccounts).mockReturnValue(
       new Map([

@@ -87,6 +87,8 @@ export type AccountHandlers = {
   'gocardless-get-banks': typeof getGoCardlessBanks;
   'gocardless-create-web-token': typeof createGoCardlessWebToken;
   'accounts-bank-sync': typeof accountsBankSync;
+  'enablebanking-import-review': typeof getEnableBankingImportReview;
+  'enablebanking-import-resolve': typeof resolveEnableBankingImport;
   'simplefin-batch-sync': typeof simpleFinBatchSync;
   'transactions-import': typeof importTransactions;
   'account-unlink': typeof unlinkAccount;
@@ -1367,6 +1369,14 @@ function handleSyncError(
       code: err.code,
     };
 
+    if (err.code === 'ENABLE_BANKING_REVIEW_REQUIRED') {
+      return {
+        ...syncError,
+        message:
+          'Review the downloaded Enable Banking transactions before importing.',
+      };
+    }
+
     if (err.category === 'RATE_LIMIT_EXCEEDED') {
       return {
         ...syncError,
@@ -1454,6 +1464,22 @@ export type SyncResponseWithErrors = SyncResponse & {
   errors: SyncError[];
 };
 
+function getEnableBankingImportReview({ id }: { id: string }) {
+  return bankSync.getEnableBankingImportReview(id);
+}
+
+function resolveEnableBankingImport({
+  id,
+  revision,
+  choices,
+}: {
+  id: string;
+  revision: string;
+  choices: Parameters<typeof bankSync.resolveEnableBankingImport>[2];
+}) {
+  return bankSync.resolveEnableBankingImport(id, revision, choices);
+}
+
 async function accountsBankSync({
   ids = [],
 }: {
@@ -1508,10 +1534,15 @@ async function accountsBankSync({
         const error = err as Error;
         await persistBankSyncError(acct.id, error);
         errors.push(handleSyncError(error, acct));
-        captureException({
-          ...error,
-          message: 'Failed syncing account "' + acct.name + '."',
-        } as Error);
+        if (
+          !isBankSyncError(error) ||
+          error.code !== 'ENABLE_BANKING_REVIEW_REQUIRED'
+        ) {
+          captureException({
+            ...error,
+            message: 'Failed syncing account "' + acct.name + '."',
+          } as Error);
+        }
       } finally {
         logger.groupEnd();
       }
@@ -1728,6 +1759,7 @@ async function unlinkAccount({ id }: { id: AccountEntity['id'] }) {
 
   const isGoCardless = accRow.account_sync_source === 'goCardless';
 
+  await bankSync.clearEnableBankingImportState(accRow);
   await db.updateAccount({
     id,
     account_id: null,
@@ -1826,6 +1858,8 @@ app.method('akahu-accounts', akahuAccounts);
 app.method('gocardless-get-banks', getGoCardlessBanks);
 app.method('gocardless-create-web-token', createGoCardlessWebToken);
 app.method('accounts-bank-sync', accountsBankSync);
+app.method('enablebanking-import-review', getEnableBankingImportReview);
+app.method('enablebanking-import-resolve', resolveEnableBankingImport);
 app.method('simplefin-batch-sync', simpleFinBatchSync);
 app.method('transactions-import', mutator(undoable(importTransactions)));
 app.method('account-unlink', mutator(unlinkAccount));

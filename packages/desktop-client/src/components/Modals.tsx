@@ -42,6 +42,7 @@ import { EditFieldModal } from './modals/EditFieldModal';
 import { EditRuleModal } from './modals/EditRuleModal';
 import { EditUserFinanceApp } from './modals/EditUser';
 import { EnableBankingExternalMsgModal } from './modals/EnableBankingExternalMsgModal';
+import { EnableBankingImportReviewModal } from './modals/EnableBankingImportReviewModal';
 import { EnableBankingInitialiseModal } from './modals/EnableBankingInitialiseModal';
 import { EnvelopeBalanceMenuModal } from './modals/EnvelopeBalanceMenuModal';
 import { EnvelopeBudgetMenuModal } from './modals/EnvelopeBudgetMenuModal';
@@ -130,6 +131,11 @@ export function Modals() {
         case 'keyboard-shortcuts':
           // don't show the hotkey help modal when a budget is not open
           return budgetId ? <KeyboardShortcutModal key={key} /> : null;
+
+        case 'enablebanking-import-review':
+          return (
+            <EnableBankingImportReviewModal key={key} {...modal.options} />
+          );
 
         case 'import-transactions':
           return <ImportTransactionsModal key={key} {...modal.options} />;

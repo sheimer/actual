@@ -47,6 +47,10 @@ export type Modal =
       options: { fileId: string; apiKey?: ApiKey; onChange: () => void };
     }
   | {
+      name: 'enablebanking-import-review';
+      options: { accountId: AccountEntity['id'] };
+    }
+  | {
       name: 'import-transactions';
       options: {
         accountId: string;

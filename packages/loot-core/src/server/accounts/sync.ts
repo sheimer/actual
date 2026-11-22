@@ -18,6 +18,7 @@ import {
   defaultMappings,
   mappingsFromString,
 } from '#server/util/custom-sync-mapping';
+import { sequential } from '#shared/async';
 import * as monthUtils from '#shared/months';
 import { q } from '#shared/query';
 import {
@@ -35,6 +36,16 @@ import type {
   TransactionEntity,
 } from '#types/models';
 
+import {
+  EnableBankingReviewRequired,
+  planEnableBankingMatches,
+} from './enable-banking-match';
+import type {
+  Choice,
+  EnableBankingMatching,
+  EnableBankingPayment,
+  Review,
+} from './enable-banking-match';
 import { getStartingBalancePayee } from './payees';
 import { title } from './title';
 
@@ -616,6 +627,7 @@ async function createNewPayees(payeesToCreate, addsAndUpdates) {
 
 export type MatchTransactionsOptions = {
   isBankSyncAccount?: boolean;
+  enableBanking?: EnableBankingMatching;
   strictIdChecking?: boolean;
   reimportDeleted?: boolean;
   payeeNameNormalization?: PayeeNameNormalization;
@@ -643,6 +655,7 @@ export async function reconcileTransactions(
   transactions,
   {
     isBankSyncAccount = false,
+    enableBanking,
     strictIdChecking = true,
     isPreview = false,
     defaultCleared = true,
@@ -665,13 +678,14 @@ export async function reconcileTransactions(
     transactionsStep3,
   } = await matchTransactions(acctId, transactions, {
     isBankSyncAccount,
+    enableBanking,
     strictIdChecking,
     reimportDeleted,
     payeeNameNormalization,
   });
 
   // Finally, generate & commit the changes
-  for (const { trans, subtransactions, match } of transactionsStep3) {
+  for (const { trans, subtransactions, match, newId } of transactionsStep3) {
     // A skipped transaction still takes part in the matching above, so the
     // other transactions match the same way as in the import preview. It is
     // not imported or merged.
@@ -767,7 +781,7 @@ export async function reconcileTransactions(
       const { forceAddTransaction: _forceAddTransaction, ...newTrans } = trans;
       const finalTransaction = {
         ...newTrans,
-        id: uuidv4(),
+        id: newId ?? uuidv4(),
         category: trans.category || null,
         cleared: trans.cleared ?? defaultCleared,
       };
@@ -791,14 +805,16 @@ export async function reconcileTransactions(
     await batchUpdateTransactions({ added, updated });
   }
 
-  logger.log('Debug data for the operations:', {
-    transactionsStep1,
-    transactionsStep2,
-    transactionsStep3,
-    added,
-    updated,
-    updatedPreview,
-  });
+  if (!enableBanking) {
+    logger.log('Debug data for the operations:', {
+      transactionsStep1,
+      transactionsStep2,
+      transactionsStep3,
+      added,
+      updated,
+      updatedPreview,
+    });
+  }
 
   return {
     added: added.map(trans => trans.id),
@@ -839,6 +855,7 @@ export async function matchTransactions(
   transactions,
   {
     isBankSyncAccount = false,
+    enableBanking,
     strictIdChecking = true,
     reimportDeleted: reimportDeletedOverride,
     payeeNameNormalization,
@@ -867,6 +884,35 @@ export async function matchTransactions(
   // The first pass runs the rules, and preps data for fuzzy matching
   const accounts: db.DbAccount[] = await db.getAccounts();
   const accountsMap = new Map(accounts.map(account => [account.id, account]));
+
+  if (enableBanking) {
+    const assignments = await planEnableBankingMatches(
+      acctId,
+      normalized.map(({ trans }) => JSON.parse(trans.raw_synced_data)),
+      reimportDeleted,
+      enableBanking,
+    );
+    const planned = [];
+    for (const [index, item] of normalized.entries()) {
+      const { match, skip, newId } = assignments[index];
+      const trans = skip
+        ? { ...item.trans, skipTransaction: true }
+        : await runRules(item.trans, accountsMap);
+      planned.push({
+        ...item,
+        trans,
+        match,
+        newId,
+        subtransactions: trans.subtransactions || item.subtransactions,
+      });
+    }
+    return {
+      payeesToCreate,
+      transactionsStep1: planned,
+      transactionsStep2: planned,
+      transactionsStep3: planned,
+    };
+  }
 
   const transactionsStep1 = [];
   for (const {
@@ -984,6 +1030,7 @@ export async function matchTransactions(
       subtransactions: trans.subtransactions || subtransactions,
       match,
       fuzzyDataset,
+      newId: undefined,
     });
   }
 
@@ -1112,6 +1159,7 @@ async function processBankSyncDownload(
   initialSync = false,
   customStartingBalance?: number,
   customStartingDate?: string,
+  enableBanking?: EnableBankingMatching,
 ) {
   // If syncing an account from sync source it must not use strictIdChecking. This allows
   // the fuzzy search to match transactions where the import IDs are different. It is a known quirk
@@ -1195,34 +1243,34 @@ async function processBankSyncDownload(
       startingBalanceDate = monthUtils.currentDay();
     }
 
-    const payee = await getStartingBalancePayee();
-
-    return runMutator(async () => {
-      // Enable Banking reports no balance when the bank refuses the request;
-      // there is then nothing to derive an opening balance from.
-      const initialId =
-        balanceToUse === null
-          ? null
-          : await db.insertTransaction({
-              account: id,
-              amount: balanceToUse,
-              category: acctRow.offbudget === 0 ? payee.category : null,
-              payee: payee.id,
-              date: startingBalanceDate,
-              cleared: true,
-              starting_balance_flag: true,
-            });
-
-      const result = await reconcileTransactions(id, transactions, {
-        isBankSyncAccount: true,
-        strictIdChecking: useStrictIdChecking,
-        updateDates,
+    async function addStartingBalance() {
+      // A missing bank balance cannot be used to derive an opening balance.
+      if (balanceToUse === null) return null;
+      const payee = await getStartingBalancePayee();
+      return db.insertTransaction({
+        account: id,
+        amount: balanceToUse,
+        category: acctRow.offbudget === 0 ? payee.category : null,
+        payee: payee.id,
+        date: startingBalanceDate,
+        cleared: true,
+        starting_balance_flag: true,
       });
-      return {
-        ...result,
-        added: initialId === null ? result.added : [initialId, ...result.added],
-      };
+    }
+
+    // Enable Banking plans the entire import before writing any transaction.
+    let initialId = enableBanking ? null : await addStartingBalance();
+    const result = await reconcileTransactions(id, transactions, {
+      isBankSyncAccount: true,
+      enableBanking,
+      strictIdChecking: useStrictIdChecking,
+      updateDates,
     });
+    if (enableBanking) initialId = await addStartingBalance();
+    return {
+      ...result,
+      added: initialId === null ? result.added : [initialId, ...result.added],
+    };
   }
 
   const transactions = originalTransactions.map(trans => ({
@@ -1230,24 +1278,248 @@ async function processBankSyncDownload(
     account: id,
   }));
 
-  return runMutator(async () => {
-    const result = await reconcileTransactions(
-      id,
-      importTransactions ? transactions : [],
-      {
-        isBankSyncAccount: true,
-        strictIdChecking: useStrictIdChecking,
-        updateDates,
-      },
-    );
+  const result = await reconcileTransactions(
+    id,
+    importTransactions ? transactions : [],
+    {
+      isBankSyncAccount: true,
+      enableBanking,
+      strictIdChecking: useStrictIdChecking,
+      updateDates,
+    },
+  );
 
-    if (currentBalance != null) {
-      await updateAccountBalance(id, currentBalance);
+  if (currentBalance != null) {
+    await updateAccountBalance(id, currentBalance);
+  }
+
+  return result;
+}
+
+type EnableBankingDownload = {
+  transactions: EnableBankingPayment[];
+  startingBalance: number | null;
+};
+
+type PendingEnableBankingImport = {
+  revision: string;
+  download: EnableBankingDownload;
+  initialSync: boolean;
+  customStartingBalance?: number;
+  customStartingDate?: string;
+  review: Review;
+  snapshot: string;
+};
+
+function enableBankingPreference(
+  account: db.DbAccount,
+  kind: 'pending' | 'decisions',
+) {
+  return `enable-banking-${kind}-${JSON.stringify([account.id, account.bank, account.account_id])}`;
+}
+
+async function readEnableBankingPreference<T>(id: string): Promise<T | null> {
+  const row = await db.first<Pick<db.DbPreference, 'value'>>(
+    'SELECT value FROM preferences WHERE id = ?',
+    [id],
+  );
+  return row?.value ? JSON.parse(row.value) : null;
+}
+
+function reviewRequired() {
+  return BankSyncError(
+    'ACCOUNT_NEEDS_ATTENTION',
+    'ENABLE_BANKING_REVIEW_REQUIRED',
+  );
+}
+
+function isLinkedEnableBankingAccount(
+  account: db.DbAccount | undefined,
+): account is db.DbAccount {
+  return (
+    !!account &&
+    !account.tombstone &&
+    !account.closed &&
+    String(account.account_sync_source) === 'enableBanking' &&
+    !!account.account_id &&
+    !!account.bank
+  );
+}
+
+export async function clearEnableBankingImportState(account: db.DbAccount) {
+  if (!isLinkedEnableBankingAccount(account)) return;
+  await batchMessages(async () => {
+    for (const kind of ['pending', 'decisions'] as const) {
+      const id = enableBankingPreference(account, kind);
+      if (await readEnableBankingPreference(id)) {
+        await db.update('preferences', { id, value: null });
+      }
     }
-
-    return result;
   });
 }
+
+export async function getEnableBankingImportReview(id: string) {
+  const account = await db.select('accounts', id);
+  if (!isLinkedEnableBankingAccount(account)) return null;
+  const pending = await readEnableBankingPreference<PendingEnableBankingImport>(
+    enableBankingPreference(account, 'pending'),
+  );
+  return pending ? { revision: pending.revision, ...pending.review } : null;
+}
+
+async function applyEnableBankingImport(
+  account: db.DbAccount,
+  pending: Omit<PendingEnableBankingImport, 'revision' | 'review' | 'snapshot'>,
+  confirmation?: { snapshot: string; choices: Choice[] },
+) {
+  const pendingKey = enableBankingPreference(account, 'pending');
+  const decisionKey = enableBankingPreference(account, 'decisions');
+  const remembered =
+    (await readEnableBankingPreference<EnableBankingMatching['remembered']>(
+      decisionKey,
+    )) ?? [];
+
+  let result: ReconcileTransactionsResult;
+  let updatedDecisions: EnableBankingMatching['remembered'] | undefined;
+  try {
+    result = await processBankSyncDownload(
+      structuredClone(pending.download),
+      account.id,
+      account,
+      pending.initialSync && !(await getAccountOldestTransaction(account.id)),
+      pending.customStartingBalance,
+      pending.customStartingDate,
+      {
+        remembered,
+        resolution: confirmation && {
+          ...confirmation,
+          makeId: uuidv4,
+          remember: entries => {
+            updatedDecisions = entries;
+          },
+        },
+      },
+    );
+  } catch (error) {
+    if (!(error instanceof EnableBankingReviewRequired)) throw error;
+    // Matching detects conflicts before any transaction or balance writes.
+    const review: PendingEnableBankingImport = {
+      ...pending,
+      revision: uuidv4(),
+      snapshot: error.snapshot,
+      review: error.review,
+    };
+    await batchMessages(async () => {
+      await db.update('preferences', {
+        id: pendingKey,
+        value: JSON.stringify(review),
+      });
+      await db.update('accounts', {
+        id: account.id,
+        bank_sync_status: 'attention-required',
+      });
+    });
+    return { review: { revision: review.revision, ...review.review } };
+  }
+
+  // Allow the transaction writer's own batches to flush before committing the
+  // review: transfer and split post-processing reads the newly written rows.
+  if (confirmation) {
+    await batchMessages(async () => {
+      if (updatedDecisions) {
+        await db.update('preferences', {
+          id: decisionKey,
+          value: JSON.stringify(updatedDecisions),
+        });
+      }
+      await db.update('preferences', { id: pendingKey, value: null });
+      await db.update('accounts', {
+        id: account.id,
+        last_sync: String(Date.now()),
+        bank_sync_status: 'ok',
+      });
+    });
+  }
+  return { result };
+}
+
+export function resolveEnableBankingImport(
+  id: string,
+  revision: string,
+  choices: Choice[],
+) {
+  return runMutator(async () => {
+    const account = await db.select('accounts', id);
+    if (!isLinkedEnableBankingAccount(account)) {
+      throw new Error('The bank account is no longer linked.');
+    }
+    const pending =
+      await readEnableBankingPreference<PendingEnableBankingImport>(
+        enableBankingPreference(account, 'pending'),
+      );
+    if (!pending || pending.revision !== revision) {
+      throw new Error('The import preview changed. Review it again.');
+    }
+    const outcome = await applyEnableBankingImport(account, pending, {
+      snapshot: pending.snapshot,
+      choices,
+    });
+    if (!outcome.result) return { review: outcome.review };
+    const { added, updated } = outcome.result;
+    return { result: { added, updated } };
+  });
+}
+
+const syncEnableBanking = sequential(
+  async (
+    id: string,
+    acctId: string,
+    since: string,
+    initialSync: boolean,
+    customStartingBalance?: number,
+    customStartingDate?: string,
+  ) => {
+    const account = await db.select('accounts', id);
+    if (!isLinkedEnableBankingAccount(account)) {
+      throw new Error('The bank account is no longer linked.');
+    }
+    if (account.account_id !== acctId) {
+      throw new Error('The bank account changed before downloading.');
+    }
+    if (await getEnableBankingImportReview(id)) throw reviewRequired();
+    const bank = await db.select('banks', account.bank);
+    const download = await downloadEnableBankingTransactions(
+      acctId,
+      since,
+      bank?.name,
+    );
+    if (!download) throw BankSyncError('NO_DATA', 'NO_DATA');
+
+    const applied = await runMutator(async () => {
+      const current = await db.select('accounts', id);
+      if (
+        !isLinkedEnableBankingAccount(current) ||
+        current.bank !== account.bank ||
+        current.account_id !== acctId
+      ) {
+        throw new Error('The bank account changed while downloading.');
+      }
+      if (await getEnableBankingImportReview(id)) throw reviewRequired();
+      const oldest = await getAccountOldestTransaction(id);
+      return applyEnableBankingImport(current, {
+        download: {
+          transactions: download.transactions,
+          startingBalance: download.startingBalance,
+        },
+        initialSync: initialSync && !oldest,
+        customStartingBalance,
+        customStartingDate,
+      });
+    });
+    if (!applied.result) throw reviewRequired();
+    return applied.result;
+  },
+);
 
 export async function syncAccount(
   userId: string | undefined,
@@ -1291,11 +1563,13 @@ export async function syncAccount(
       newAccount,
     );
   } else if (acctRow.account_sync_source === 'enableBanking') {
-    const bankRow = await db.select('banks', acctRow.bank);
-    download = await downloadEnableBankingTransactions(
+    return syncEnableBanking(
+      id,
       acctId,
       syncStartDate,
-      bankRow?.name,
+      newAccount,
+      customStartingBalance,
+      customStartingDate,
     );
   } else {
     throw new Error(
@@ -1303,13 +1577,15 @@ export async function syncAccount(
     );
   }
 
-  return processBankSyncDownload(
-    download,
-    id,
-    acctRow,
-    newAccount,
-    customStartingBalance,
-    customStartingDate,
+  return runMutator(() =>
+    processBankSyncDownload(
+      download,
+      id,
+      acctRow,
+      newAccount,
+      customStartingBalance,
+      customStartingDate,
+    ),
   );
 }
 
@@ -1384,7 +1660,9 @@ export async function simpleFinBatchSync(
     }
 
     promises.push(
-      processBankSyncDownload(download, account.id, acctRow, newAccount)
+      runMutator(() =>
+        processBankSyncDownload(download, account.id, acctRow, newAccount),
+      )
         .then(res => ({
           accountId: account.id,
           res,

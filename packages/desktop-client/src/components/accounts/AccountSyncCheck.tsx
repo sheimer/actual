@@ -169,6 +169,28 @@ export function AccountSyncCheck() {
   // to the persisted status for failures that happened on another client
   const error = failedAccounts.get(id) ?? getFailedSyncError(account);
 
+  if (
+    account.account_sync_source === 'enableBanking' &&
+    account.bank_sync_status === 'attention-required'
+  ) {
+    return (
+      <Button
+        onPress={() =>
+          dispatch(
+            pushModal({
+              modal: {
+                name: 'enablebanking-import-review',
+                options: { accountId: id },
+              },
+            }),
+          )
+        }
+      >
+        <Trans>Review bank import</Trans>
+      </Button>
+    );
+  }
+
   const { type, code } = error;
   const showAuth =
     (type === 'ITEM_ERROR' && code === 'ITEM_LOGIN_REQUIRED') ||
