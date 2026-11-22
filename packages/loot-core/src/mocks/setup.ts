@@ -1,6 +1,8 @@
 // @ts-strict-ignore
 import * as nativeFs from 'fs';
 
+import type { v5 as UuidV5 } from 'uuid';
+
 import * as fetchClient from '#platform/client/connection';
 import * as sqlite from '#platform/server/sqlite';
 import * as db from '#server/db';
@@ -58,7 +60,8 @@ global.resetRandomId = () => {
   _id = 1;
 };
 
-vi.mock('uuid', () => ({
+vi.mock('uuid', async importOriginal => ({
+  ...(await importOriginal<{ v5: typeof UuidV5 }>()),
   v4: () => {
     return 'id' + _id++;
   },

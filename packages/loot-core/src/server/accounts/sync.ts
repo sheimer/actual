@@ -3,6 +3,7 @@ import * as dateFns from 'date-fns';
 import { v4 as uuidv4 } from 'uuid';
 
 import * as asyncStorage from '#platform/server/asyncStorage';
+import * as fs from '#platform/server/fs';
 import { logger } from '#platform/server/log';
 import { aqlQuery } from '#server/aql';
 import * as db from '#server/db';
@@ -10,6 +11,7 @@ import { TRANSACTION_SORT_INCREMENT } from '#server/db/sort';
 import { TransactionError } from '#server/errors';
 import { runMutator } from '#server/mutators';
 import { post } from '#server/post';
+import { getPrefs } from '#server/prefs';
 import { getServer } from '#server/server-config';
 import { batchMessages } from '#server/sync';
 import { batchUpdateTransactions } from '#server/transactions';
@@ -368,6 +370,45 @@ async function downloadAkahuTransactions(
   return retVal;
 }
 
+const getEnableBankingDeviceId = sequential(async () => {
+  const existing = await asyncStorage.getItem('enable-banking-import-device');
+  if (existing) return existing;
+  const id = uuidv4();
+  await asyncStorage.setItem('enable-banking-import-device', id);
+  return id;
+});
+
+async function checkEnableBankingImportDevice(
+  accountId: string,
+  claim = false,
+) {
+  const server = getServer();
+  const token = await asyncStorage.getItem('user-token');
+  if (!server || !token) {
+    throw BankSyncError(
+      'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+      'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+    );
+  }
+  const response = await post(
+    server.ENABLEBANKING_SERVER + '/import-device',
+    { accountId, deviceId: await getEnableBankingDeviceId(), claim },
+    { 'X-ACTUAL-TOKEN': token },
+  );
+  if (response.error_code) {
+    throw BankSyncError(response.error_type, response.error_code);
+  }
+}
+
+export async function claimEnableBankingImportDevice(id: string) {
+  const account = await db.select('accounts', id);
+  if (!isLinkedEnableBankingAccount(account)) {
+    throw new Error('The bank account is no longer linked.');
+  }
+  await checkEnableBankingImportDevice(account.account_id, true);
+  return 'ok';
+}
+
 async function downloadEnableBankingTransactions(
   acctId: string,
   since: string,
@@ -384,6 +425,7 @@ async function downloadEnableBankingTransactions(
       accountId: acctId,
       startDate: since,
       aspspName,
+      deviceId: await getEnableBankingDeviceId(),
     },
     {
       'X-ACTUAL-TOKEN': userToken,
@@ -1311,19 +1353,66 @@ type PendingEnableBankingImport = {
   snapshot: string;
 };
 
-function enableBankingPreference(
-  account: db.DbAccount,
-  kind: 'pending' | 'decisions',
-) {
-  return `enable-banking-${kind}-${JSON.stringify([account.id, account.bank, account.account_id])}`;
+function enableBankingConnection(account: db.DbAccount) {
+  return JSON.stringify([account.id, account.bank, account.account_id]);
 }
 
-async function readEnableBankingPreference<T>(id: string): Promise<T | null> {
-  const row = await db.first<Pick<db.DbPreference, 'value'>>(
-    'SELECT value FROM preferences WHERE id = ?',
-    [id],
+function pendingEnableBankingPath(account: db.DbAccount) {
+  const id = getPrefs()?.id;
+  if (!id) throw new Error('No budget is open.');
+  return fs.join(
+    fs.getBudgetDir(id),
+    `enable-banking-${encodeURIComponent(account.id)}.json`,
   );
-  return row?.value ? JSON.parse(row.value) : null;
+}
+
+async function readPendingEnableBankingImport(account: db.DbAccount) {
+  const path = pendingEnableBankingPath(account);
+  if (!(await fs.exists(path))) return null;
+  let contents: string;
+  try {
+    contents = await fs.readFile(path);
+  } catch (error) {
+    // The review can finish while the UI is reading its preview.
+    if (!(await fs.exists(path))) return null;
+    throw error;
+  }
+  const data: PendingEnableBankingImport & { connection: string } =
+    JSON.parse(contents);
+  return data.connection === enableBankingConnection(account) ? data : null;
+}
+
+async function writePendingEnableBankingImport(
+  account: db.DbAccount,
+  pending: PendingEnableBankingImport,
+) {
+  await fs.writeFile(
+    pendingEnableBankingPath(account),
+    JSON.stringify({
+      ...pending,
+      connection: enableBankingConnection(account),
+    }),
+  );
+}
+
+async function clearPendingEnableBankingImport(account: db.DbAccount) {
+  const path = pendingEnableBankingPath(account);
+  if (await fs.exists(path)) await fs.removeFile(path);
+}
+
+function enableBankingDecisionPrefix(account: db.DbAccount) {
+  return `enable-banking-decision-${enableBankingConnection(account)}-`;
+}
+
+async function getEnableBankingDecisions(account: db.DbAccount) {
+  const prefix = enableBankingDecisionPrefix(account);
+  const rows = await db.all<Pick<db.DbPreference, 'value'>>(
+    'SELECT value FROM preferences WHERE substr(id, 1, ?) = ? AND value IS NOT NULL',
+    [prefix.length, prefix],
+  );
+  return rows.map(row =>
+    JSON.parse(row.value),
+  ) as EnableBankingMatching['remembered'];
 }
 
 function reviewRequired() {
@@ -1347,13 +1436,16 @@ function isLinkedEnableBankingAccount(
 }
 
 export async function clearEnableBankingImportState(account: db.DbAccount) {
-  if (!isLinkedEnableBankingAccount(account)) return;
+  if (String(account.account_sync_source) !== 'enableBanking') return;
+  await clearPendingEnableBankingImport(account);
+  const prefix = enableBankingDecisionPrefix(account);
+  const rows = await db.all<Pick<db.DbPreference, 'id'>>(
+    'SELECT id FROM preferences WHERE substr(id, 1, ?) = ? AND value IS NOT NULL',
+    [prefix.length, prefix],
+  );
   await batchMessages(async () => {
-    for (const kind of ['pending', 'decisions'] as const) {
-      const id = enableBankingPreference(account, kind);
-      if (await readEnableBankingPreference(id)) {
-        await db.update('preferences', { id, value: null });
-      }
+    for (const { id } of rows) {
+      await db.update('preferences', { id, value: null });
     }
   });
 }
@@ -1361,9 +1453,7 @@ export async function clearEnableBankingImportState(account: db.DbAccount) {
 export async function getEnableBankingImportReview(id: string) {
   const account = await db.select('accounts', id);
   if (!isLinkedEnableBankingAccount(account)) return null;
-  const pending = await readEnableBankingPreference<PendingEnableBankingImport>(
-    enableBankingPreference(account, 'pending'),
-  );
+  const pending = await readPendingEnableBankingImport(account);
   return pending ? { revision: pending.revision, ...pending.review } : null;
 }
 
@@ -1372,12 +1462,7 @@ async function applyEnableBankingImport(
   pending: Omit<PendingEnableBankingImport, 'revision' | 'review' | 'snapshot'>,
   confirmation?: { snapshot: string; choices: Choice[] },
 ) {
-  const pendingKey = enableBankingPreference(account, 'pending');
-  const decisionKey = enableBankingPreference(account, 'decisions');
-  const remembered =
-    (await readEnableBankingPreference<EnableBankingMatching['remembered']>(
-      decisionKey,
-    )) ?? [];
+  const remembered = await getEnableBankingDecisions(account);
 
   let result: ReconcileTransactionsResult;
   let updatedDecisions: EnableBankingMatching['remembered'] | undefined;
@@ -1409,15 +1494,10 @@ async function applyEnableBankingImport(
       snapshot: error.snapshot,
       review: error.review,
     };
-    await batchMessages(async () => {
-      await db.update('preferences', {
-        id: pendingKey,
-        value: JSON.stringify(review),
-      });
-      await db.update('accounts', {
-        id: account.id,
-        bank_sync_status: 'attention-required',
-      });
+    await writePendingEnableBankingImport(account, review);
+    await db.update('accounts', {
+      id: account.id,
+      bank_sync_status: 'attention-required',
     });
     return { review: { revision: review.revision, ...review.review } };
   }
@@ -1426,19 +1506,20 @@ async function applyEnableBankingImport(
   // review: transfer and split post-processing reads the newly written rows.
   if (confirmation) {
     await batchMessages(async () => {
-      if (updatedDecisions) {
+      const prefix = enableBankingDecisionPrefix(account);
+      for (const decision of updatedDecisions ?? []) {
         await db.update('preferences', {
-          id: decisionKey,
-          value: JSON.stringify(updatedDecisions),
+          id: prefix + decision.evidence,
+          value: JSON.stringify(decision),
         });
       }
-      await db.update('preferences', { id: pendingKey, value: null });
       await db.update('accounts', {
         id: account.id,
         last_sync: String(Date.now()),
         bank_sync_status: 'ok',
       });
     });
+    await clearPendingEnableBankingImport(account);
   }
   return { result };
 }
@@ -1453,12 +1534,14 @@ export function resolveEnableBankingImport(
     if (!isLinkedEnableBankingAccount(account)) {
       throw new Error('The bank account is no longer linked.');
     }
-    const pending =
-      await readEnableBankingPreference<PendingEnableBankingImport>(
-        enableBankingPreference(account, 'pending'),
-      );
+    const pending = await readPendingEnableBankingImport(account);
     if (!pending || pending.revision !== revision) {
       throw new Error('The import preview changed. Review it again.');
+    }
+    // An offline ZIP import has no shared budget identity. Shared budgets
+    // must validate ownership even when there is no new bank request.
+    if (getPrefs()?.cloudFileId) {
+      await checkEnableBankingImportDevice(account.account_id);
     }
     const outcome = await applyEnableBankingImport(account, pending, {
       snapshot: pending.snapshot,
@@ -1487,6 +1570,9 @@ const syncEnableBanking = sequential(
       throw new Error('The bank account changed before downloading.');
     }
     if (await getEnableBankingImportReview(id)) throw reviewRequired();
+    // A client connected to an older server must fail before reaching its
+    // unguarded transactions endpoint.
+    await checkEnableBankingImportDevice(acctId);
     const bank = await db.select('banks', account.bank);
     const download = await downloadEnableBankingTransactions(
       acctId,

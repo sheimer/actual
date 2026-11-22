@@ -1,10 +1,12 @@
 import React from 'react';
 
+import { send } from '@actual-app/core/platform/client/connection';
 import type { AccountEntity } from '@actual-app/core/types/models';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { markAccountSuccess } from '#accounts/accountsSlice';
 import { useAccounts } from '#hooks/useAccounts';
 import { useCurrentAccess } from '#hooks/useCurrentAccess';
 import { useFailedAccounts } from '#hooks/useFailedAccounts';
@@ -14,6 +16,14 @@ import { pushModal } from '#modals/modalsSlice';
 import { AccountSyncCheck } from './AccountSyncCheck';
 
 const mockDispatch = vi.fn();
+
+vi.mock(
+  '@actual-app/core/platform/client/connection',
+  async importOriginal => ({
+    ...(await importOriginal()),
+    send: vi.fn(),
+  }),
+);
 
 vi.mock('react-router', async importOriginal => ({
   ...(await importOriginal()),
@@ -62,6 +72,53 @@ describe('AccountSyncCheck', () => {
       isFileOwner: true,
       cloudFileId: 'file-1',
     });
+  });
+
+  it('allows explicit device selection before fetching from the bank', async () => {
+    vi.mocked(useAccounts).mockReturnValue({
+      data: [
+        {
+          ...baseAccount,
+          account_sync_source: 'enableBanking',
+          bank_sync_status: 'ok',
+        },
+      ],
+      isLoading: false,
+    } as ReturnType<typeof useAccounts>);
+    vi.mocked(useFailedAccounts).mockReturnValue(
+      new Map([
+        [
+          baseAccount.id,
+          {
+            type: 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+            code: 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+          },
+        ],
+      ]),
+    );
+    vi.mocked(send).mockResolvedValueOnce('ok');
+
+    render(
+      <TestProviders>
+        <AccountSyncCheck />
+      </TestProviders>,
+    );
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Use this device for bank imports' }),
+    );
+    expect(send).toHaveBeenCalledWith('enablebanking-claim-import-device', {
+      id: 'acc-1',
+    });
+    expect(
+      vi
+        .mocked(send)
+        .mock.calls.some(([name]) => name === 'accounts-bank-sync'),
+    ).toBe(false);
+    await waitFor(() =>
+      expect(mockDispatch).toHaveBeenCalledWith(
+        markAccountSuccess({ id: 'acc-1' }),
+      ),
+    );
   });
 
   it('opens the bank import review from persisted attention status', async () => {

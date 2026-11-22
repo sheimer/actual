@@ -7,9 +7,11 @@ import { SvgExclamationOutline } from '@actual-app/components/icons/v1';
 import { Popover } from '@actual-app/components/popover';
 import { theme } from '@actual-app/components/theme';
 import { View } from '@actual-app/components/view';
+import { send } from '@actual-app/core/platform/client/connection';
 import type { AccountEntity } from '@actual-app/core/types/models';
 
 import { useUnlinkAccountMutation } from '#accounts';
+import { markAccountSuccess } from '#accounts/accountsSlice';
 import { getFailedSyncError, isAccountFailedSync } from '#accounts/syncStatus';
 import { Link } from '#components/common/Link';
 import { authorizeBank as authorizeEnableBanking } from '#enablebanking';
@@ -110,6 +112,8 @@ export function AccountSyncCheck() {
   const dispatch = useDispatch();
   const { id } = useParams();
   const [open, setOpen] = useState(false);
+  const [claimPending, setClaimPending] = useState(false);
+  const [claimFailed, setClaimFailed] = useState(false);
   const triggerRef = useRef(null);
   const { getErrorMessage } = useErrorMessage();
 
@@ -161,13 +165,49 @@ export function AccountSyncCheck() {
   }
 
   const account = accounts.find(account => account.id === id);
-  if (!account || !isAccountFailedSync(account)) {
-    return null;
+  if (!account) return null;
+  const localError = failedAccounts.get(id);
+  if (
+    account.account_sync_source === 'enableBanking' &&
+    localError?.code === 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED'
+  ) {
+    return (
+      <View style={{ gap: 5 }}>
+        <Button
+          isDisabled={claimPending}
+          onPress={async () => {
+            setClaimPending(true);
+            setClaimFailed(false);
+            try {
+              await send('enablebanking-claim-import-device', { id });
+              dispatch(markAccountSuccess({ id }));
+            } catch {
+              setClaimFailed(true);
+            } finally {
+              setClaimPending(false);
+            }
+          }}
+        >
+          <Trans>Use this device for bank imports</Trans>
+        </Button>
+        {claimFailed && (
+          <span role="alert">
+            <Trans>
+              Could not select this device. Another device may already be
+              selected.
+            </Trans>
+          </span>
+        )}
+      </View>
+    );
   }
+  if (localError?.code === 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH') {
+    return <Trans>Bank imports are handled on the selected device.</Trans>;
+  }
+  if (!isAccountFailedSync(account)) return null;
 
-  // prefer the detailed error from the client that ran the sync, fall back
-  // to the persisted status for failures that happened on another client
-  const error = failedAccounts.get(id) ?? getFailedSyncError(account);
+  // Prefer a detailed error from this client, then use the persisted status.
+  const error = localError ?? getFailedSyncError(account);
 
   if (
     account.account_sync_source === 'enableBanking' &&

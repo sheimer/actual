@@ -13,6 +13,7 @@ import {
 } from '#util/middlewares';
 import { isBlockedIp } from '#util/ssrf';
 
+import { enableBankingImportDeviceError } from './import-device';
 import type {
   EnableBankingSession,
   PsuHeaders,
@@ -542,9 +543,32 @@ app.post(
 );
 
 app.post(
+  '/import-device',
+  handleError(async (req: Request, res: Response) => {
+    const { accountId, deviceId, claim } = req.body ?? {};
+    if (typeof accountId !== 'string' || !accountId) {
+      res.send({
+        status: 'ok',
+        data: { error_code: 'INVALID_INPUT', error_type: 'INVALID_INPUT' },
+      });
+      return;
+    }
+    const error = enableBankingImportDeviceError(
+      accountId,
+      deviceId,
+      claim === true,
+    );
+    res.send({
+      status: 'ok',
+      data: error ? { error_code: error, error_type: error } : {},
+    });
+  }),
+);
+
+app.post(
   '/transactions',
   handleError(async (req: Request, res: Response) => {
-    const { accountId, startDate, aspspName } = req.body || {};
+    const { accountId, startDate, aspspName, deviceId } = req.body || {};
 
     if (!accountId || !startDate) {
       res.send({
@@ -553,6 +577,15 @@ app.post(
           error_code: 'INVALID_INPUT',
           error_type: 'Missing accountId or startDate',
         },
+      });
+      return;
+    }
+
+    const deviceError = enableBankingImportDeviceError(accountId, deviceId);
+    if (deviceError) {
+      res.send({
+        status: 'ok',
+        data: { error_code: deviceError, error_type: deviceError },
       });
       return;
     }

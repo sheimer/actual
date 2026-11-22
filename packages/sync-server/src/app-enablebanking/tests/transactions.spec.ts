@@ -52,6 +52,18 @@ vi.mock('../../app-gocardless/util/handle-error', () => ({
 // Mock provider requests (the service is stubbed below, this just guards stray calls)
 vi.mock('undici', () => ({ fetch: vi.fn() }));
 
+vi.mock('#account-db', () => ({
+  getAccountDb: () => accountDb,
+  isAdmin: () => false,
+}));
+
+const { openDatabase } = await import('#db');
+const { createEnableBankingImportDevicesTable } =
+  await import('../import-device');
+let accountDb: ReturnType<typeof openDatabase>;
+const ownerId = '8fbac2eb-08c1-4c94-8f38-8f52821a013c';
+const otherId = '377d70d4-8dc5-4577-96fa-03ec09cb7dae';
+
 const { handlers } = await import('../app-enablebanking');
 const { enableBankingService } =
   await import('../services/enablebanking-service');
@@ -66,13 +78,66 @@ const ids = (txns: Array<{ transactionId: string }>) =>
 
 describe('POST /transactions', () => {
   beforeEach(() => {
+    accountDb = openDatabase(':memory:');
+    createEnableBankingImportDevicesTable();
+    accountDb.mutate(
+      'INSERT INTO enable_banking_import_devices VALUES (?, ?)',
+      ['acc-1', ownerId],
+    );
     vi.spyOn(enableBankingService, 'getBalances').mockResolvedValue({
       balances: [],
     });
   });
 
   afterEach(() => {
+    accountDb.close();
     vi.restoreAllMocks();
+  });
+
+  it('rejects two competing devices before making a bank request', async () => {
+    const getBalances = vi
+      .spyOn(enableBankingService, 'getBalances')
+      .mockResolvedValue({ balances: [] });
+    const getTransactions = vi
+      .spyOn(enableBankingService, 'getAllTransactions')
+      .mockResolvedValue([]);
+    const claims = await Promise.all(
+      [ownerId, otherId].map(deviceId =>
+        request(app)
+          .post('/import-device')
+          .send({ accountId: 'new-account', deviceId, claim: true }),
+      ),
+    );
+    const denied = claims.findIndex(
+      claim =>
+        claim.body.data.error_code === 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH',
+    );
+    expect(denied).toBeGreaterThanOrEqual(0);
+    expect(claims[1 - denied].body.data).toEqual({});
+    const deniedId = [ownerId, otherId][denied];
+    const allowed = [ownerId, otherId][1 - denied];
+
+    for (const [accountId, deviceId, code] of [
+      ['new-account', deniedId, 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH'],
+      ['unclaimed-account', allowed, 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED'],
+      ['new-account', undefined, 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED'],
+    ]) {
+      const response = await request(app).post('/transactions').send({
+        accountId,
+        deviceId,
+        startDate: '2026-03-01',
+      });
+      expect(response.body.data.error_code).toBe(code);
+    }
+    expect(getTransactions).not.toHaveBeenCalled();
+    expect(getBalances).not.toHaveBeenCalled();
+    const response = await request(app).post('/transactions').send({
+      accountId: 'new-account',
+      deviceId: allowed,
+      startDate: '2026-03-01',
+    });
+    expect(response.body.data.transactions.all).toEqual([]);
+    expect(getTransactions).toHaveBeenCalledTimes(1);
   });
 
   it('skips a date-less pending transaction while keeping valid booked and pending ones', async () => {
@@ -86,7 +151,7 @@ describe('POST /transactions', () => {
 
     const res = await request(app)
       .post('/transactions')
-      .send({ accountId: 'acc-1', startDate: '2026-03-01' });
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
 
     expect(res.body.status).toBe('ok');
 
@@ -108,7 +173,7 @@ describe('POST /transactions', () => {
 
     const res = await request(app)
       .post('/transactions')
-      .send({ accountId: 'acc-1', startDate: '2026-03-01' });
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
 
     expect(res.body.data.transactions.all).toHaveLength(2);
     expect(ids(res.body.data.transactions.all)).toEqual(['ref-002', 'tx-003']);
@@ -123,7 +188,7 @@ describe('POST /transactions', () => {
 
     const res = await request(app)
       .post('/transactions')
-      .send({ accountId: 'acc-1', startDate: '2026-03-01' });
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
 
     const [first, second] = ids(res.body.data.transactions.all);
     expect(first).toBeTruthy();
@@ -143,7 +208,7 @@ describe('POST /transactions', () => {
 
     const res = await request(app)
       .post('/transactions')
-      .send({ accountId: 'acc-1', startDate: '2026-03-01' });
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
 
     expect(res.body.status).toBe('ok');
     expect(ids(res.body.data.transactions.all)).toEqual(['ref-002']);
@@ -161,7 +226,7 @@ describe('POST /transactions', () => {
     await request(app)
       .post('/transactions')
       .set('X-Forwarded-For', '::ffff:136.243.37.31')
-      .send({ accountId: 'acc-1', startDate: '2026-03-01' });
+      .send({ accountId: 'acc-1', deviceId: ownerId, startDate: '2026-03-01' });
 
     expect(getAllTransactions).toHaveBeenCalledWith(
       'acc-1',

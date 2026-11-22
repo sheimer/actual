@@ -3,6 +3,10 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock all external dependencies before importing the app
+vi.mock('../import-device', () => ({
+  enableBankingImportDeviceError: () => null,
+}));
+
 vi.mock('../../services/secrets-service', () => ({
   SecretName: {
     enablebanking_applicationId: 'enablebanking_applicationId',

@@ -1,4 +1,5 @@
 import { differenceInDays, parseISO } from 'date-fns';
+import { v5 as uuidv5 } from 'uuid';
 
 import * as db from '#server/db';
 import { amountToInteger } from '#shared/util';
@@ -59,13 +60,16 @@ export class EnableBankingReviewRequired extends Error {
 }
 
 function evidence(payment: EnableBankingPayment) {
-  return JSON.stringify([
-    payment.transaction_date || payment.date,
-    amountToInteger(Number(payment.transactionAmount.amount)),
-    payment.transactionAmount.currency,
-    payment.payeeName,
-    payment.remittance_information ?? payment.notes ?? '',
-  ]);
+  return uuidv5(
+    JSON.stringify([
+      payment.transaction_date || payment.date,
+      amountToInteger(Number(payment.transactionAmount.amount)),
+      payment.transactionAmount.currency,
+      payment.payeeName,
+      payment.remittance_information ?? payment.notes ?? '',
+    ]),
+    uuidv5.URL,
+  );
 }
 
 function readSource(raw: string | null): EnableBankingPayment | null {
@@ -119,6 +123,25 @@ export async function planEnableBankingMatches(
     const source = readSource(row.raw_synced_data);
     return { row, source, key: source ? evidence(source) : null };
   });
+  const existingById = new Map(
+    existing.map(candidate => [candidate.row.id, candidate]),
+  );
+  const existingByEvidence = new Map<string, typeof existing>();
+  const existingByAmount = new Map<number, typeof existing>();
+  for (const candidate of existing) {
+    const { row, source, key } = candidate;
+    const amount = source
+      ? amountToInteger(Number(source.transactionAmount.amount))
+      : row.amount;
+    const byAmount = existingByAmount.get(amount) ?? [];
+    byAmount.push(candidate);
+    existingByAmount.set(amount, byAmount);
+    if (key) {
+      const byEvidence = existingByEvidence.get(key) ?? [];
+      byEvidence.push(candidate);
+      existingByEvidence.set(key, byEvidence);
+    }
+  }
   const assignments: Assignment[] = payments.map(() => ({ match: null }));
   const groups = new Map<string, number[]>();
   const conflicts: Review['conflicts'] = [];
@@ -136,19 +159,21 @@ export async function planEnableBankingMatches(
   // Resolve all strong matches before considering weaker competing candidates.
   const unresolved = new Map<string, number[]>();
   for (const [key, indices] of groups) {
-    const exact = existing.filter(candidate => candidate.key === key);
+    const exact = existingByEvidence.get(key) ?? [];
     const saved = memory.get(key);
-    const targets = saved?.targets.map(target =>
-      target
-        ? existing.find(
-            ({ row, key: sourceKey }) =>
-              row.id === target.id &&
-              ('source' in target
-                ? sourceKey === target.source
-                : row.date === target.date && row.amount === target.amount),
-          )?.row
-        : null,
-    );
+    const targets = saved?.targets.map(target => {
+      if (!target) return null;
+      const found = existingById.get(target.id);
+      if (!found) return undefined;
+      const { row, key } = found;
+      return (
+        'source' in target
+          ? key === target.source
+          : row.date === target.date && row.amount === target.amount
+      )
+        ? row
+        : undefined;
+    });
 
     if (
       saved &&
@@ -192,15 +217,11 @@ export async function planEnableBankingMatches(
     for (const index of indices) {
       const payment = payments[index];
       const amount = amountToInteger(Number(payment.transactionAmount.amount));
-      const candidates = existing.filter(
+      const candidates = (existingByAmount.get(amount) ?? []).filter(
         ({ row, source, key: candidateKey }) => {
           if (reserved.has(row.id)) return candidateKey === key;
-          const sourceAmount = source
-            ? amountToInteger(Number(source.transactionAmount.amount))
-            : row.amount;
           const sourceDate = source?.date ?? db.fromDateRepr(row.date);
           return (
-            sourceAmount === amount &&
             (!source ||
               source.transactionAmount.currency ===
                 payment.transactionAmount.currency) &&
@@ -243,10 +264,13 @@ export async function planEnableBankingMatches(
   if (!conflicts.length && !resolution) return assignments;
 
   const review = { conflicts };
-  const snapshot = JSON.stringify([
-    review,
-    assignments.map(({ match, skip }) => [match?.id ?? null, !!skip]),
-  ]);
+  const snapshot = uuidv5(
+    JSON.stringify([
+      review,
+      assignments.map(({ match, skip }) => [match?.id ?? null, !!skip]),
+    ]),
+    uuidv5.URL,
+  );
   if (!resolution || resolution.snapshot !== snapshot) {
     throw new EnableBankingReviewRequired(review, snapshot);
   }
@@ -291,10 +315,10 @@ export async function planEnableBankingMatches(
         throw new Error('Invalid transaction decision.');
     }
   }
-  const updatedMemory = new Map(memory);
+  const updatedMemory: Remembered[] = [];
   for (const key of conflictEvidence) {
     const indices = groups.get(key) ?? [];
-    updatedMemory.set(key, {
+    updatedMemory.push({
       evidence: key,
       targets: indices.map(index => {
         const { match, newId } = assignments[index];
@@ -306,6 +330,6 @@ export async function planEnableBankingMatches(
       }),
     });
   }
-  resolution.remember([...updatedMemory.values()]);
+  resolution.remember(updatedMemory);
   return assignments;
 }

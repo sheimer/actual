@@ -88,6 +88,7 @@ export type AccountHandlers = {
   'gocardless-create-web-token': typeof createGoCardlessWebToken;
   'accounts-bank-sync': typeof accountsBankSync;
   'enablebanking-import-review': typeof getEnableBankingImportReview;
+  'enablebanking-claim-import-device': typeof claimEnableBankingImportDevice;
   'enablebanking-import-resolve': typeof resolveEnableBankingImport;
   'simplefin-batch-sync': typeof simpleFinBatchSync;
   'transactions-import': typeof importTransactions;
@@ -535,6 +536,8 @@ async function linkEnableBankingAccount({
   if (id == null) {
     throw new Error('id was not assigned in linkEnableBankingAccount');
   }
+
+  await bankSync.claimEnableBankingImportDevice(id);
 
   const syncRes = await bankSync.syncAccount(
     undefined,
@@ -1369,6 +1372,20 @@ function handleSyncError(
       code: err.code,
     };
 
+    if (err.code === 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED') {
+      return {
+        ...syncError,
+        message: 'Choose an import device for this Enable Banking account.',
+      };
+    }
+    if (err.code === 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH') {
+      return {
+        ...syncError,
+        message:
+          'Use the selected import device for this Enable Banking account.',
+      };
+    }
+
     if (err.code === 'ENABLE_BANKING_REVIEW_REQUIRED') {
       return {
         ...syncError,
@@ -1454,6 +1471,13 @@ function persistBankSyncError(
   accountId: AccountEntity['id'],
   err: Error | PostError | BankSyncError,
 ) {
+  // Ownership is specific to this client. Do not replace the shared status.
+  if (
+    isBankSyncError(err) &&
+    err.code.startsWith('ENABLE_BANKING_IMPORT_DEVICE_')
+  ) {
+    return;
+  }
   return db.update('accounts', {
     id: accountId,
     bank_sync_status: getBankSyncStatusFromError(err),
@@ -1463,6 +1487,10 @@ function persistBankSyncError(
 export type SyncResponseWithErrors = SyncResponse & {
   errors: SyncError[];
 };
+
+function claimEnableBankingImportDevice({ id }: { id: string }) {
+  return bankSync.claimEnableBankingImportDevice(id);
+}
 
 function getEnableBankingImportReview({ id }: { id: string }) {
   return bankSync.getEnableBankingImportReview(id);
@@ -1536,7 +1564,8 @@ async function accountsBankSync({
         errors.push(handleSyncError(error, acct));
         if (
           !isBankSyncError(error) ||
-          error.code !== 'ENABLE_BANKING_REVIEW_REQUIRED'
+          (error.code !== 'ENABLE_BANKING_REVIEW_REQUIRED' &&
+            !error.code.startsWith('ENABLE_BANKING_IMPORT_DEVICE_'))
         ) {
           captureException({
             ...error,
@@ -1859,6 +1888,7 @@ app.method('gocardless-get-banks', getGoCardlessBanks);
 app.method('gocardless-create-web-token', createGoCardlessWebToken);
 app.method('accounts-bank-sync', accountsBankSync);
 app.method('enablebanking-import-review', getEnableBankingImportReview);
+app.method('enablebanking-claim-import-device', claimEnableBankingImportDevice);
 app.method('enablebanking-import-resolve', resolveEnableBankingImport);
 app.method('simplefin-batch-sync', simpleFinBatchSync);
 app.method('transactions-import', mutator(undoable(importTransactions)));

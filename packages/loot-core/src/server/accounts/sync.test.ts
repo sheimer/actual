@@ -1,5 +1,9 @@
 // @ts-strict-ignore
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+
 import * as asyncStorage from '#platform/server/asyncStorage';
+import * as fs from '#platform/server/fs';
 import * as db from '#server/db';
 import { loadMappings } from '#server/db/mappings';
 import { post } from '#server/post';
@@ -1394,6 +1398,16 @@ describe('SimpleFin batch sync', () => {
 });
 
 describe('Enable Banking sync', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = await mkdtemp(fs.join(tmpdir(), 'actual-enable-banking-'));
+    fs._setDocumentDir(testDir);
+    const { id } = await loadPrefs();
+    await mkdir(fs.getBudgetDir(id));
+    handlers['/enablebanking/import-device'] = () => ({});
+  });
+
   async function setupEnableBankingAccount() {
     vi.mocked(asyncStorage.getItem).mockResolvedValue('test-token');
     vi.mocked(asyncStorage.multiGet).mockResolvedValue({
@@ -1643,6 +1657,131 @@ describe('Enable Banking sync', () => {
     expect(await getAllTransactions()).toEqual(before);
   });
 
+  test('keeps a large pending response off budget sync and reopens it locally', async () => {
+    const id = await setupEnableBankingAccount();
+    const sync = () =>
+      accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+    mockBankResponse([payment('a', 'Synthetic Shop', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    const original = await getAllTransactions();
+
+    const largePayment = {
+      ...payment('a', 'Synthetic Other Shop', '-12.34'),
+      referenceData: 'x'.repeat(5 * 1024 * 1024),
+    };
+    const fetch = mockBankResponse([
+      largePayment,
+      payment('b', 'Synthetic Books', '-27.00'),
+    ]);
+    expect((await sync()).errors).toMatchObject([
+      { code: 'ENABLE_BANKING_REVIEW_REQUIRED' },
+    ]);
+    expect(await getAllTransactions()).toEqual(original);
+    expect(
+      await db.first(
+        "SELECT id FROM preferences WHERE id LIKE 'enable-banking-pending-%'",
+      ),
+    ).toBeNull();
+    const budgetDir = fs.getBudgetDir('test');
+    expect(
+      (await fs.readFile(fs.join(budgetDir, `enable-banking-${id}.json`)))
+        .length,
+    ).toBeGreaterThan(5 * 1024 * 1024);
+
+    await loadPrefs();
+    const review = await accountsApp.handlers['enablebanking-import-review']({
+      id,
+    });
+    expect(review?.conflicts).toHaveLength(1);
+    const result = await accountsApp.handlers['enablebanking-import-resolve']({
+      id,
+      revision: review!.revision,
+      choices: [{ index: review!.conflicts[0].index, action: 'skip' }],
+    });
+    expect(result.result?.added).toHaveLength(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(
+      await fs.exists(fs.join(budgetDir, `enable-banking-${id}.json`)),
+    ).toBe(false);
+    const stored = await db.all<Pick<db.DbPreference, 'value'>>(
+      "SELECT value FROM preferences WHERE id LIKE 'enable-banking-decision-%'",
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].value?.length).toBeLessThan(200);
+  });
+
+  test('requires device authorization before requesting a bank download', async () => {
+    const id = await setupEnableBankingAccount();
+    const fetch = mockBankResponse([payment('a', 'Synthetic Shop', '-12.34')]);
+    handlers['/enablebanking/import-device'] = () => ({
+      error_code: 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+      error_type: 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED',
+    });
+    const result = await accountsApp.handlers['accounts-bank-sync']({
+      ids: [id],
+    });
+    expect(result.errors).toMatchObject([
+      { code: 'ENABLE_BANKING_IMPORT_DEVICE_REQUIRED' },
+    ]);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(await getAllTransactions()).toHaveLength(0);
+    expect((await db.select('accounts', id)).bank_sync_status).toBeNull();
+  });
+
+  test('another device cannot resolve a pending shared import', async () => {
+    const id = await setupEnableBankingAccount();
+    const sync = () =>
+      accountsApp.handlers['accounts-bank-sync']({ ids: [id] });
+    mockBankResponse([payment('a', 'Synthetic Shop', '-12.34')]);
+    expect((await sync()).errors).toHaveLength(0);
+    const fetch = mockBankResponse([
+      payment('a', 'Synthetic Other Shop', '-12.34'),
+    ]);
+    expect((await sync()).errors).toMatchObject([
+      { code: 'ENABLE_BANKING_REVIEW_REQUIRED' },
+    ]);
+    await savePrefs({ cloudFileId: 'shared-synthetic' }, { avoidSync: true });
+
+    let authorized = false;
+    const access = vi.fn(() =>
+      authorized
+        ? {}
+        : {
+            error_type: 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH',
+            error_code: 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH',
+          },
+    );
+    handlers['/enablebanking/import-device'] = access;
+    const getReview = () =>
+      accountsApp.handlers['enablebanking-import-review']({ id });
+    const review = await getReview();
+    const before = await getAllTransactions();
+    await expect(
+      accountsApp.handlers['enablebanking-import-resolve']({
+        id,
+        revision: review!.revision,
+        choices: [{ index: 0, action: 'add' }],
+      }),
+    ).rejects.toMatchObject({ code: 'ENABLE_BANKING_IMPORT_DEVICE_MISMATCH' });
+    expect(await getReview()).toEqual(review);
+    expect(await getAllTransactions()).toEqual(before);
+    expect(access).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    authorized = true;
+    const resolved = await accountsApp.handlers['enablebanking-import-resolve'](
+      {
+        id,
+        revision: review!.revision,
+        choices: [{ index: 0, action: 'add' }],
+      },
+    );
+    expect(resolved.result?.added).toHaveLength(1);
+    expect(await getReview()).toBeNull();
+    expect(access).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   test('preserves identical postings and requests a review of a partial response', async () => {
     const id = await setupEnableBankingAccount();
     const sync = () =>
@@ -1673,8 +1812,11 @@ describe('Enable Banking sync', () => {
     expect(await getAllTransactions()).toEqual(before);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     delete handlers['/enablebanking/transactions'];
+    delete handlers['/enablebanking/import-device'];
+    await rm(testDir, { recursive: true, force: true });
+    fs._setDocumentDir(null);
   });
 
   test.each([

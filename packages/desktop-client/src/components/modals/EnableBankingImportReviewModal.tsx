@@ -109,7 +109,9 @@ export function EnableBankingImportReviewModal({
             />
           ) : (
             <Text>
-              <Trans>There is no bank import waiting for review.</Trans>
+              <Trans>
+                There is no bank import waiting for review on this device.
+              </Trans>
             </Text>
           )}
           {!pendingImport && (
